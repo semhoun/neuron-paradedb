@@ -1,0 +1,60 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        dependencies: [highest]
+        include:
+          - php: '8.1'
+            dependencies: lowest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_pgsql
+          tools: composer:v2
+          coverage: none
+      - run: composer validate --strict
+      - if: matrix.dependencies == 'highest'
+        run: composer update --prefer-dist --no-interaction
+      - if: matrix.dependencies == 'lowest'
+        run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction
+      - run: composer test
+      - run: composer analyse
+      - run: composer style:check
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      paradedb:
+        image: paradedb/paradedb:0.25.9-pg18
+        env:
+          POSTGRES_DB: neuron_paradedb_test
+          POSTGRES_USER: neuron_test
+          POSTGRES_PASSWORD: neuron_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U neuron_test -d neuron_paradedb_test"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      PARADEDB_DSN: pgsql:host=127.0.0.1;port=5432;dbname=neuron_paradedb_test
+      PARADEDB_USER: neuron_test
+      PARADEDB_PASSWORD: neuron_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_pgsql
+          tools: composer:v2
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      - run: composer test:integration

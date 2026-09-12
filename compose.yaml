@@ -1,0 +1,14 @@
+services:
+  paradedb:
+    image: paradedb/paradedb:0.25.9-pg18
+    environment:
+      POSTGRES_DB: neuron_paradedb_test
+      POSTGRES_USER: neuron_test
+      POSTGRES_PASSWORD: neuron_test
+    ports:
+      - "127.0.0.1:${PARADEDB_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neuron_test -d neuron_paradedb_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
