@@ -7,7 +7,7 @@ Vector similarity and BM25 hybrid retrieval for [Neuron AI](https://github.com/n
 - PHP 8.1 or newer (8.x), with `pdo` and `pdo_pgsql`.
 - Neuron AI 3.x.
 - ParadeDB **0.25.9 / PostgreSQL 18**, including `pg_search` and `vector`. Plain PostgreSQL with pgvector alone is not sufficient.
-- Nonzero, finite embeddings with the same dimension and model for ingestion and queries. HNSW `vector` indexes support up to 2,000 dimensions.
+- Nonzero, finite embeddings with a finite, nonzero float32 squared norm and the same dimension and model for ingestion and queries. Numerically unsafe magnitudes are rejected rather than silently normalized. HNSW `vector` indexes support up to 2,000 dimensions.
 
 ```sh
 composer require semhoun/neuron-paradedb
@@ -125,6 +125,15 @@ docker compose down -v
 The Compose database is test-only, bound to localhost; override `PARADEDB_PORT` if needed. Integration tests use their own temporary tables and are skipped when `PARADEDB_DSN` is unset. Unit tests require no database or external API keys.
 
 CI covers PHP 8.1 through 8.5, latest compatible dependencies and a lowest-dependency PHP 8.1 job. A separate integration job runs against the pinned `paradedb/paradedb:0.25.9-pg18` image. Later ParadeDB releases are not yet qualified.
+
+Validated compatibility:
+
+| Component | Tested versions |
+| --- | --- |
+| PHP | 8.1, 8.2, 8.3, 8.4, 8.5 (CI quality/unit tests) |
+| Neuron AI | 3.15.27 (lowest resolved dependencies), 3.16.13 (latest) |
+| ParadeDB / pg_search | 0.25.9 |
+| PostgreSQL / pgvector | 18.6 / 0.8.4 |
 
 ## Origin and License
 

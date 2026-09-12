@@ -290,7 +290,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         if (!array_is_list($embedding) || count($embedding) !== $this->dimensions) {
             throw new VectorStoreException('Embedding must be a list with exactly '.$this->dimensions.' dimensions.');
         }
-        $nonzero = false;
+        $squaredNorm = 0.0;
         foreach ($embedding as $value) {
             if ((!is_int($value) && !is_float($value)) || !is_finite((float) $value)) {
                 throw new VectorStoreException('Embedding components must be finite numbers.');
@@ -300,10 +300,12 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             if (!is_finite($stored)) {
                 throw new VectorStoreException('Embedding components must fit in a pgvector float32.');
             }
-            $nonzero = $nonzero || $stored != 0.0;
+            $square = unpack('fvalue', pack('f', $stored * $stored))['value'];
+            $squaredNorm = unpack('fvalue', pack('f', $squaredNorm + $square))['value'];
         }
-        if (!$nonzero) {
-            throw new VectorStoreException('Cosine similarity requires a nonzero embedding.');
+        // Cosine accumulation also uses float32, not just the stored components.
+        if (!is_finite($squaredNorm) || $squaredNorm <= 0.0) {
+            throw new VectorStoreException('Cosine similarity requires a finite, nonzero float32 squared norm.');
         }
 
         return json_encode($embedding, JSON_THROW_ON_ERROR);

@@ -254,6 +254,25 @@ final class ParadeDBVectorStoreTest extends TestCase
         self::assertSame(['keep'], $this->storedIds());
     }
 
+    public function testNumericallyUnsafeCosineVectorsAreRejected(): void
+    {
+        foreach ([[1e30, 0.0, 0.0], [1e-30, 0.0, 0.0]] as $embedding) {
+            foreach (['add', 'similarity', 'hybrid'] as $operation) {
+                try {
+                    match ($operation) {
+                        'add' => $this->store->addDocument($this->document('unsafe', $embedding)),
+                        'similarity' => $this->store->similaritySearch($embedding),
+                        'hybrid' => $this->store->hybridSearch('query', $embedding),
+                    };
+                    self::fail('Unsafe cosine norm must be rejected.');
+                } catch (VectorStoreException $exception) {
+                    self::assertStringContainsString('squared norm', $exception->getMessage());
+                }
+            }
+        }
+        self::assertSame([], $this->storedIds());
+    }
+
     public function testMissingEmbeddingIsRejected(): void
     {
         $this->expectException(VectorStoreException::class);
