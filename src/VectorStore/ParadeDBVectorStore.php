@@ -25,7 +25,11 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         string $tableName = 'rag_documents',
         protected readonly int $topK = 4,
         protected readonly int $rrfK = 60,
+        protected ?string $collectionId = null,
     ) {
+        if ($collectionId === '') {
+            throw new InvalidArgumentException('Collection IDs must be nonempty; use null for no collection.');
+        }
         if ($dimensions < 1 || $topK < 1 || $rrfK < 1) {
             throw new InvalidArgumentException('Dimensions, topK and rrfK must be positive integers.');
         }
@@ -40,6 +44,146 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         $this->validateSchema();
     }
 
+    /** Explicit administrative migration; requires exclusive access and permission to alter the table and indexes. */
+    public static function upgradeToV11(PDO $pdo, int $dimensions = 1536, string $tableName = 'rag_documents'): void
+    {
+        if ($dimensions < 1) {
+            throw new InvalidArgumentException('Dimensions must be a positive integer.');
+        }
+        if (strlen($tableName) > 48 || preg_match('/^[a-z_][a-z0-9_]*$/iD', $tableName) !== 1) {
+            throw new InvalidArgumentException('Table names must be SQL identifiers of at most 48 ASCII characters.');
+        }
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $quote = static fn (string $name): string => '"'.str_replace('"', '""', $name).'"';
+        $execute = static function (string $sql) use ($pdo): void {
+            if ($pdo->exec($sql) === false) {
+                throw new VectorStoreException('Database operation failed: '.($pdo->errorInfo()[2] ?? 'unknown error'));
+            }
+        };
+        /** @param array<string, mixed> $parameters */
+        $query = static function (string $sql, array $parameters) use ($pdo): PDOStatement {
+            $statement = $pdo->prepare($sql);
+            if ($statement === false) {
+                throw new VectorStoreException('Database preparation failed: '.($pdo->errorInfo()[2] ?? 'unknown error'));
+            }
+            if (!$statement->execute($parameters)) {
+                throw new VectorStoreException('Database execution failed: '.($statement->errorInfo()[2] ?? 'unknown error'));
+            }
+
+            return $statement;
+        };
+        $savepoint = $pdo->inTransaction() ? $quote('neuron_paradedb_'.bin2hex(random_bytes(12))) : null;
+        if ($savepoint !== null) {
+            $execute('SAVEPOINT '.$savepoint);
+        } elseif (!$pdo->beginTransaction()) {
+            throw new VectorStoreException('Unable to begin the upgrade transaction.');
+        }
+
+        try {
+            $table = $query(<<<'SQL'
+                SELECT c.oid, c.relkind, c.relname, n.nspname
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.oid = pg_catalog.to_regclass(:table_name)
+                SQL, [':table_name' => $quote($tableName)])->fetch(PDO::FETCH_ASSOC);
+            if ($table === false) {
+                throw new VectorStoreException('Cannot upgrade a missing table: '.$tableName);
+            }
+            if (!in_array($table['relkind'], ['r', 'p'], true)) {
+                throw new VectorStoreException('The configured relation must be a table.');
+            }
+            $qualifiedTable = $quote($table['nspname']).'.'.$quote($table['relname']);
+            $execute('LOCK TABLE '.$qualifiedTable.' IN ACCESS EXCLUSIVE MODE');
+            // Detect replacement between catalog resolution and acquiring the lock.
+            $oid = $query('SELECT pg_catalog.to_regclass(:table_name)::oid', [':table_name' => $qualifiedTable])->fetchColumn();
+            if ((string) $oid !== (string) $table['oid']) {
+                throw new VectorStoreException('The table changed while acquiring the upgrade lock.');
+            }
+            $newColumns = (int) $query(<<<'SQL'
+                SELECT count(*) FROM pg_catalog.pg_attribute
+                WHERE attrelid = :oid AND attnum > 0 AND NOT attisdropped
+                  AND attname IN ('collection_id', 'search_id')
+                SQL, [':oid' => $table['oid']])->fetchColumn();
+            if ($newColumns === 1) {
+                throw new VectorStoreException('Cannot upgrade a partially migrated table.');
+            }
+            if ($newColumns === 0) {
+                $primaryKey = $query(<<<'SQL'
+                    SELECT c.conname FROM pg_catalog.pg_constraint c
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid
+                      AND a.attname = 'id' AND NOT a.attisdropped
+                    WHERE c.conrelid = :oid AND c.contype = 'p' AND NOT c.condeferrable
+                      AND c.conkey = ARRAY[a.attnum]
+                    SQL, [':oid' => $table['oid']])->fetchColumn();
+                if (!is_string($primaryKey)) {
+                    throw new VectorStoreException('Legacy schema must have a non-deferrable primary key on id alone.');
+                }
+                $indexName = $tableName.'_bm25_idx';
+                $index = $query(<<<'SQL'
+                    SELECT c.relname,
+                           am.amname = 'bm25' AND i.indrelid = t.oid AND i.indisvalid
+                           AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts = 2
+                           AND pg_catalog.pg_get_indexdef(c.oid, 1, true) = 'id'
+                           AND pg_catalog.pg_get_indexdef(c.oid, 2, true) = 'content'
+                           AND EXISTS (SELECT 1 FROM pg_catalog.pg_options_to_table(c.reloptions)
+                               WHERE option_name = 'key_field' AND option_value = 'id') AS compatible
+                    FROM pg_catalog.pg_class t
+                    JOIN pg_catalog.pg_class c ON c.relnamespace = t.relnamespace AND c.relname = :index_name
+                    LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+                    LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+                    WHERE t.oid = :oid
+                    SQL, [':oid' => $table['oid'], ':index_name' => $indexName])->fetch(PDO::FETCH_ASSOC);
+                if ($index !== false) {
+                    if (!in_array($index['compatible'], [true, 1, '1', 't'], true)) {
+                        throw new VectorStoreException('Cannot replace incompatible object named '.$indexName.'.');
+                    }
+                    $execute('DROP INDEX '.$quote($table['nspname']).'.'.$quote($index['relname']));
+                }
+                $execute('ALTER TABLE '.$qualifiedTable." ADD COLUMN collection_id TEXT NOT NULL DEFAULT '',"
+                    .' ADD COLUMN search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE');
+                $execute('ALTER TABLE '.$qualifiedTable.' DROP CONSTRAINT '.$quote($primaryKey)
+                    .', ADD PRIMARY KEY (collection_id, id)');
+                $execute('CREATE INDEX '.$quote($indexName).' ON '.$qualifiedTable
+                    ." USING bm25 (search_id, content) WITH (key_field = 'search_id')");
+            } else {
+                // Validate named objects before allowing IF NOT EXISTS to keep an existing index.
+                new self($pdo, $dimensions, $tableName);
+                $execute('CREATE INDEX IF NOT EXISTS '.$quote($tableName.'_bm25_idx').' ON '.$qualifiedTable
+                    ." USING bm25 (search_id, content) WITH (key_field = 'search_id')");
+            }
+            // The regular constructor remains the authority for the resulting 1.1 schema.
+            new self($pdo, $dimensions, $tableName);
+            if ($savepoint !== null) {
+                $execute('RELEASE SAVEPOINT '.$savepoint);
+            } elseif (!$pdo->commit()) {
+                throw new VectorStoreException('Unable to commit the upgrade transaction.');
+            }
+        } catch (Throwable $error) {
+            try {
+                if ($savepoint !== null) {
+                    $execute('ROLLBACK TO SAVEPOINT '.$savepoint);
+                    $execute('RELEASE SAVEPOINT '.$savepoint);
+                } elseif ($pdo->inTransaction() && !$pdo->rollBack()) {
+                    throw new VectorStoreException('Unable to roll back the upgrade transaction.');
+                }
+            } catch (Throwable $rollbackError) {
+                throw new VectorStoreException('Schema upgrade failed; rollback also failed: '.$rollbackError->getMessage(), 0, $error);
+            }
+            throw $error;
+        }
+    }
+
+    public function forCollection(?string $collectionId): static
+    {
+        if ($collectionId === '') {
+            throw new InvalidArgumentException('Collection IDs must be nonempty; use null for no collection.');
+        }
+        $store = clone $this;
+        $store->collectionId = $collectionId;
+
+        return $store;
+    }
+
     /** Requires permission to create the vector and pg_search extensions, table and indexes. */
     public function setupDatabase(): void
     {
@@ -49,12 +193,15 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         $this->executeSql(sprintf(
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS %s (
-                    id TEXT PRIMARY KEY,
+                    collection_id TEXT NOT NULL DEFAULT '',
+                    id TEXT NOT NULL,
+                    search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
                     content TEXT NOT NULL,
                     source_type VARCHAR(255) NOT NULL,
                     source_name VARCHAR(255) NOT NULL,
                     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    embedding VECTOR(%d) NOT NULL
+                    embedding VECTOR(%d) NOT NULL,
+                    PRIMARY KEY (collection_id, id)
                 )
                 SQL,
             $this->tableName,
@@ -62,7 +209,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         ));
         $this->validateSchema();
         $this->executeSql(sprintf(
-            "CREATE INDEX IF NOT EXISTS %s ON %s USING bm25 (id, content) WITH (key_field = 'id')",
+            "CREATE INDEX IF NOT EXISTS %s ON %s USING bm25 (search_id, content) WITH (key_field = 'search_id')",
             $this->bm25IndexName,
             $this->tableName,
         ));
@@ -100,9 +247,9 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         try {
             $statement = $this->prepare(sprintf(
                 <<<'SQL'
-                    INSERT INTO %s (id, content, source_type, source_name, metadata, embedding)
-                    VALUES (:id, :content, :source_type, :source_name, CAST(:metadata AS jsonb), CAST(:embedding AS vector))
-                    ON CONFLICT (id) DO UPDATE SET
+                    INSERT INTO %s (collection_id, id, content, source_type, source_name, metadata, embedding)
+                    VALUES (:collection_id, :id, :content, :source_type, :source_name, CAST(:metadata AS jsonb), CAST(:embedding AS vector))
+                    ON CONFLICT (collection_id, id) DO UPDATE SET
                         content = EXCLUDED.content,
                         source_type = EXCLUDED.source_type,
                         source_name = EXCLUDED.source_name,
@@ -116,6 +263,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
                     throw new InvalidArgumentException('Every batch entry must be a Document.');
                 }
                 $this->executeStatement($statement, [
+                    ':collection_id' => $this->collectionId ?? '',
                     ':id' => (string) $document->getId(),
                     ':content' => $document->getContent(),
                     ':source_type' => $document->getSourceType(),
@@ -171,8 +319,8 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             }
         }
 
-        $conditions = [];
-        $parameters = [];
+        $conditions = ['collection_id = :collection_id'];
+        $parameters = [':collection_id' => $this->collectionId ?? ''];
         foreach ($filters as $column => $value) {
             if (!in_array($column, ['source_type', 'source_name'], true) || !is_string($value)) {
                 throw new InvalidArgumentException('Only string source_type and source_name filters are supported.');
@@ -198,13 +346,14 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
                 SELECT id, content, source_type, source_name, metadata, embedding,
                        embedding <=> CAST(:embedding AS vector) AS distance
                 FROM %s
+                WHERE collection_id = :collection_id
                 ORDER BY distance
                 LIMIT %d
                 SQL,
             $this->tableName,
             $this->topK,
         ));
-        $this->executeStatement($statement, [':embedding' => $vector]);
+        $this->executeStatement($statement, [':embedding' => $vector, ':collection_id' => $this->collectionId ?? '']);
 
         return $this->hydrateDocuments($statement, true);
     }
@@ -220,31 +369,32 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         $statement = $this->prepare(sprintf(
             <<<'SQL'
                 WITH vector_results AS (
-                    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> CAST(:embedding AS vector)) AS rank
+                    SELECT search_id, ROW_NUMBER() OVER (ORDER BY embedding <=> CAST(:embedding AS vector)) AS rank
                     FROM %1$s
+                    WHERE collection_id = :vector_collection_id
                     ORDER BY embedding <=> CAST(:ordered_embedding AS vector)
                     LIMIT %2$d
                 ),
                 bm25_results AS (
-                    SELECT id, ROW_NUMBER() OVER (ORDER BY pdb.score(id) DESC) AS rank
+                    SELECT search_id, ROW_NUMBER() OVER (ORDER BY pdb.score(search_id) DESC) AS rank
                     FROM %1$s
-                    WHERE content ||| :query
-                    ORDER BY pdb.score(id) DESC
+                    WHERE content ||| :query AND collection_id = :bm25_collection_id
+                    ORDER BY pdb.score(search_id) DESC
                     LIMIT %2$d
                 ),
                 fused AS (
-                    SELECT id, SUM(score) AS score
+                    SELECT search_id, SUM(score) AS score
                     FROM (
-                        SELECT id, 1.0 / (%3$d::numeric + rank) AS score FROM vector_results
+                        SELECT search_id, 1.0 / (%3$d::numeric + rank) AS score FROM vector_results
                         UNION ALL
-                        SELECT id, 1.0 / (%3$d::numeric + rank) AS score FROM bm25_results
+                        SELECT search_id, 1.0 / (%3$d::numeric + rank) AS score FROM bm25_results
                     ) rankings
-                    GROUP BY id
+                    GROUP BY search_id
                 )
                 SELECT documents.id, documents.content, documents.source_type,
                        documents.source_name, documents.metadata, documents.embedding, fused.score
                 FROM fused
-                JOIN %1$s documents ON documents.id = fused.id
+                JOIN %1$s documents ON documents.search_id = fused.search_id
                 ORDER BY fused.score DESC, documents.id
                 LIMIT %4$d
                 SQL,
@@ -253,7 +403,13 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             $this->rrfK,
             $this->topK,
         ));
-        $this->executeStatement($statement, [':embedding' => $vector, ':ordered_embedding' => $vector, ':query' => $query]);
+        $this->executeStatement($statement, [
+            ':embedding' => $vector,
+            ':ordered_embedding' => $vector,
+            ':query' => $query,
+            ':vector_collection_id' => $this->collectionId ?? '',
+            ':bm25_collection_id' => $this->collectionId ?? '',
+        ]);
 
         return $this->hydrateDocuments($statement);
     }
@@ -325,12 +481,20 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             throw new VectorStoreException('The configured relation must be a table.');
         }
         $statement = $this->prepare(<<<'SQL'
-            SELECT a.attname, t.typname, a.atttypmod, a.attnotnull,
+            SELECT a.attname, t.typname, a.atttypmod, a.attnotnull, a.attidentity,
                    EXISTS (
                        SELECT 1 FROM pg_catalog.pg_index i
-                       WHERE i.indrelid = a.attrelid AND i.indisprimary
+                       WHERE i.indrelid = a.attrelid AND i.indisprimary AND i.indimmediate
+                         AND i.indnkeyatts = 2 AND i.indkey[0] = a.attnum
+                         AND i.indkey[1] = (SELECT attnum FROM pg_catalog.pg_attribute
+                             WHERE attrelid = a.attrelid AND attname = 'id' AND NOT attisdropped)
+                   ) AS primary_key,
+                   EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_index i
+                       WHERE i.indrelid = a.attrelid AND i.indisunique AND i.indisvalid AND i.indimmediate
                          AND i.indnkeyatts = 1 AND i.indkey[0] = a.attnum
-                   ) AS primary_key
+                         AND i.indpred IS NULL AND i.indexprs IS NULL
+                   ) AS unique_key
             FROM pg_catalog.pg_attribute a
             JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
             WHERE a.attrelid = :oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -340,19 +504,48 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         while ($column = $statement->fetch(PDO::FETCH_ASSOC)) {
             $columns[$column['attname']] = $column;
         }
-        foreach (['id' => ['text'], 'content' => ['text'], 'source_type' => ['text', 'varchar'],
+        foreach (['collection_id' => ['text'], 'search_id' => ['int8'], 'id' => ['text'], 'content' => ['text'], 'source_type' => ['text', 'varchar'],
             'source_name' => ['text', 'varchar'], 'metadata' => ['jsonb'], 'embedding' => ['vector']] as $name => $types) {
             $column = $columns[$name] ?? null;
             if ($column === null || !in_array($column['typname'], $types, true)
                 || !in_array($column['attnotnull'], [true, 1, '1', 't'], true)) {
-                throw new VectorStoreException('Incompatible or missing table column: '.$name);
+                throw new VectorStoreException('Schema migration required: incompatible or missing table column: '.$name);
             }
         }
         if ((int) $columns['embedding']['atttypmod'] !== $this->dimensions) {
             throw new VectorStoreException('Existing embedding dimension does not match '.$this->dimensions.'.');
         }
-        if (!in_array($columns['id']['primary_key'], [true, 1, '1', 't'], true)) {
-            throw new VectorStoreException('The id column must be the single-column primary key.');
+        if (!in_array($columns['collection_id']['primary_key'], [true, 1, '1', 't'], true)) {
+            throw new VectorStoreException('Schema migration required: primary key must be non-deferrable (collection_id, id).');
+        }
+        if ($columns['search_id']['attidentity'] !== 'a'
+            || !in_array($columns['search_id']['unique_key'], [true, 1, '1', 't'], true)) {
+            throw new VectorStoreException('Schema migration required: search_id must be GENERATED ALWAYS AS IDENTITY and globally unique.');
+        }
+        // Resolve the expected index in the table's schema, not independently through search_path.
+        $statement = $this->prepare(<<<'SQL'
+            SELECT am.amname, i.indisvalid, i.indpred IS NULL AS unfiltered,
+                   i.indrelid = t.oid AS correct_table,
+                   pg_catalog.pg_get_indexdef(c.oid, 1, true) AS first_column,
+                   pg_catalog.pg_get_indexdef(c.oid, 2, true) AS second_column,
+                   i.indnkeyatts,
+                   EXISTS (SELECT 1 FROM pg_catalog.pg_options_to_table(c.reloptions)
+                           WHERE option_name = 'key_field' AND option_value = 'search_id') AS correct_key
+            FROM pg_catalog.pg_class t
+            JOIN pg_catalog.pg_class c ON c.relnamespace = t.relnamespace AND c.relname = :index_name
+            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+            LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+            WHERE t.oid = :oid
+            SQL);
+        $this->executeStatement($statement, [':oid' => $table['oid'], ':index_name' => trim($this->bm25IndexName, '"')]);
+        $index = $statement->fetch(PDO::FETCH_ASSOC);
+        if ($index !== false && ($index['amname'] !== 'bm25'
+            || (int) $index['indnkeyatts'] !== 2 || $index['first_column'] !== 'search_id' || $index['second_column'] !== 'content'
+            || !in_array($index['indisvalid'], [true, 1, '1', 't'], true)
+            || !in_array($index['unfiltered'], [true, 1, '1', 't'], true)
+            || !in_array($index['correct_table'], [true, 1, '1', 't'], true)
+            || !in_array($index['correct_key'], [true, 1, '1', 't'], true))) {
+            throw new VectorStoreException('Schema migration required: incompatible BM25 index; expected (search_id, content) with key_field search_id.');
         }
     }
 

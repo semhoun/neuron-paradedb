@@ -27,6 +27,7 @@ final class ParadeDBVectorStoreTest extends TestCase
 
         $this->pdo = new PDO($dsn, getenv('PARADEDB_USER') ?: 'postgres', getenv('PARADEDB_PASSWORD') ?: '', [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_EMULATE_PREPARES => false,
         ]);
         $this->table = 'test_paradedb_'.bin2hex(random_bytes(8));
         $this->store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, 60);
@@ -46,8 +47,13 @@ final class ParadeDBVectorStoreTest extends TestCase
     public function testSetupIsIdempotentAndPreservesDocuments(): void
     {
         $this->store->addDocument($this->document('retained', [1.0, 0.0, 0.0]));
-        $this->store->setupDatabase();
+        $collection = $this->store->forCollection('A');
+        $collection->addDocument($this->document('retained', [1.0, 0.0, 0.0]));
+        foreach ([$this->store, $collection, $this->store->forCollection('B')] as $store) {
+            $store->setupDatabase();
+        }
         self::assertSame(['retained'], $this->storedIds());
+        self::assertSame(['retained'], $this->storedIds('A'));
     }
 
     public function testRejectsExistingTableWithDifferentDimensions(): void
@@ -58,7 +64,8 @@ final class ParadeDBVectorStoreTest extends TestCase
 
     public function testDropTableIsIdempotent(): void
     {
-        $this->store->dropTable();
+        $this->store->addDocument($this->document('global', [1.0, 0.0, 0.0]));
+        $this->store->forCollection('A')->dropTable();
         $this->store->dropTable();
         $statement = $this->pdo->prepare('SELECT to_regclass(:table)');
         $statement->execute(['table' => $this->table]);
@@ -288,6 +295,467 @@ final class ParadeDBVectorStoreTest extends TestCase
         self::assertSame(['retained'], $this->storedIds());
     }
 
+    public function testSamePublicIdIsIsolatedAcrossLiteralCollectionsAndUpserts(): void
+    {
+        $collections = [null, 'A', 'B', '0', '00', ' A ', ' ', "O'Reilly\\'; DROP TABLE ignored; --"];
+        foreach ($collections as $offset => $collection) {
+            $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, 60, $collection);
+            $document = $this->document('same-public-id', [1.0, 0.0, 0.0]);
+            $document->content = 'sharedtoken content '.$offset;
+            $document->metadata = ['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset];
+            $store->addDocument($document);
+        }
+        $identities = $this->pdo->query("SELECT collection_id, search_id FROM {$this->table} ORDER BY collection_id")->fetchAll(PDO::FETCH_KEY_PAIR);
+        self::assertCount(count($collections), array_unique($identities));
+
+        $changed = $this->document('same-public-id', [0.8, 0.6, 0.0]);
+        $changed->content = 'sharedtoken updated';
+        $changed->metadata = ['updated' => true];
+        $this->store->forCollection('A')->addDocument($changed);
+        self::assertSame($identities, $this->pdo->query("SELECT collection_id, search_id FROM {$this->table} ORDER BY collection_id")->fetchAll(PDO::FETCH_KEY_PAIR));
+
+        foreach ($collections as $offset => $collection) {
+            $store = $this->store->forCollection('unused')->forCollection($collection);
+            foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('sharedtoken', [1.0, 0.0, 0.0])] as $results) {
+                self::assertCount(1, $results);
+                self::assertSame('same-public-id', $results[0]->id);
+                self::assertSame($collection === 'A' ? $changed->content : 'sharedtoken content '.$offset, $results[0]->content);
+                self::assertEquals($collection === 'A' ? $changed->metadata : ['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset], $results[0]->metadata);
+            }
+        }
+        self::assertSame('sharedtoken content 0', $this->store->similaritySearch([1.0, 0.0, 0.0])[0]->content);
+        $empty = $this->store->forCollection('empty');
+        self::assertSame([], $empty->similaritySearch([1.0, 0.0, 0.0]));
+        self::assertSame([], $empty->hybridSearch('sharedtoken', [1.0, 0.0, 0.0]));
+        $empty->deleteBy('manual');
+        self::assertCount(count($collections), $this->pdo->query("SELECT id FROM {$this->table}")->fetchAll());
+    }
+
+    public function testEveryDeletionFormIsScopedForNamedAndUnscopedStores(): void
+    {
+        foreach ([null, "O'Reilly\\' OR 1=1 --"] as $collection) {
+            $target = $this->store->forCollection($collection);
+            foreach (['native_pair', 'native_type', 'array_pair', 'array_type', 'array_name', 'deprecated'] as $form) {
+                foreach ([$target, $this->store->forCollection('keep')] as $store) {
+                    $store->addDocument($this->document('shared', [1.0, 0.0, 0.0], 'web', 'source'));
+                    $store->addDocument($this->document('unrelated', [1.0, 0.0, 0.0], 'file', 'elsewhere'));
+                }
+                $result = match ($form) {
+                    'native_pair' => $target->deleteBy('web', 'source'),
+                    'native_type' => $target->deleteBy('web'),
+                    'array_pair' => $target->deleteBy(['source_type' => 'web', 'source_name' => 'source']),
+                    'array_type' => $target->deleteBy(['source_type' => 'web']),
+                    'array_name' => $target->deleteBy(['source_name' => 'source']),
+                    'deprecated' => $target->deleteBySource('web', 'source'),
+                };
+                self::assertSame($target, $result);
+                self::assertSame(['unrelated'], $this->storedIds($collection));
+                self::assertSame(['shared', 'unrelated'], $this->storedIds('keep'));
+            }
+        }
+    }
+
+    public function testVectorCandidatesAreFilteredBeforeBothSearchLimits(): void
+    {
+        $target = $this->store->forCollection('target');
+        $target->addDocuments([
+            $this->document('local-first', [0.8, 0.6, 0.0]),
+            $this->document('local-second', [0.6, 0.8, 0.0]),
+        ]);
+        foreach ([null, 'other'] as $collection) {
+            for ($i = 0; $i < 6; ++$i) {
+                $this->store->forCollection($collection)->addDocument($this->document('outside-'.$i, [1.0, 0.0, 0.0]));
+            }
+        }
+        foreach ([$target->similaritySearch([1.0, 0.0, 0.0]), $target->hybridSearch('nonexistentlexeme', [1.0, 0.0, 0.0])] as $results) {
+            self::assertSame(['local-first', 'local-second'], array_map(static fn (Document $document): string => (string) $document->id, $results));
+        }
+        $results = $target->hybridSearch('nonexistentlexeme', [1.0, 0.0, 0.0]);
+        self::assertEqualsWithDelta(1 / 61, $results[0]->score, 0.00000001);
+        self::assertEqualsWithDelta(1 / 62, $results[1]->score, 0.00000001);
+    }
+
+    public function testLexicalCandidatesAreFilteredBeforeLimitAndRanking(): void
+    {
+        $target = $this->store->forCollection('target');
+        for ($i = 0; $i < 5; ++$i) {
+            $target->addDocument($this->document('semantic-'.$i, [1.0, $i / 10, 0.0]));
+        }
+        $lexical = $this->document('lexical-only', [0.0, 1.0, 0.0]);
+        $lexical->content = 'needle '.str_repeat('padding ', 100);
+        $target->addDocument($lexical);
+        for ($i = 0; $i < 6; ++$i) {
+            $outside = $this->document('outside-'.$i, [1.0, 0.0, 0.0]);
+            $outside->content = 'needle';
+            $this->store->forCollection('other')->addDocument($outside);
+        }
+        // Prove the fixture would starve the local lexical candidate without a pre-limit filter.
+        $global = $this->pdo->query("SELECT collection_id FROM {$this->table} WHERE content ||| 'needle' ORDER BY pdb.score(search_id) DESC LIMIT 4")->fetchAll(PDO::FETCH_COLUMN);
+        self::assertSame(['other', 'other', 'other', 'other'], $global);
+        $results = $target->hybridSearch('needle', [1.0, 0.0, 0.0]);
+        self::assertSame(['lexical-only', 'semantic-0'], array_map(static fn (Document $document): string => (string) $document->id, $results));
+        foreach ($results as $result) {
+            self::assertEqualsWithDelta(1 / 61, $result->score, 0.00000001);
+        }
+    }
+
+    public function testProvisionedSchemaHasCompositePrimaryKeyAndAlwaysIdentity(): void
+    {
+        $primary = $this->pdo->query("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = '{$this->table}'::regclass AND contype = 'p'")->fetchColumn();
+        self::assertSame('PRIMARY KEY (collection_id, id)', $primary);
+        $columns = $this->pdo->query("SELECT column_name, data_type, is_nullable, column_default, identity_generation FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{$this->table}'")->fetchAll(PDO::FETCH_UNIQUE | PDO::FETCH_ASSOC);
+        self::assertSame('text', $columns['collection_id']['data_type']);
+        self::assertSame('NO', $columns['collection_id']['is_nullable']);
+        self::assertSame("''::text", $columns['collection_id']['column_default']);
+        self::assertSame('bigint', $columns['search_id']['data_type']);
+        self::assertSame('NO', $columns['search_id']['is_nullable']);
+        self::assertSame('ALWAYS', $columns['search_id']['identity_generation']);
+        $this->store->addDocument($this->document('first', [1.0, 0.0, 0.0]));
+        try {
+            $this->pdo->exec("INSERT INTO {$this->table} (collection_id, id, search_id, content, source_type, source_name, embedding) OVERRIDING SYSTEM VALUE SELECT 'other', id, search_id, content, source_type, source_name, embedding FROM {$this->table}");
+            self::fail('search_id must be globally unique, not merely unique within a collection.');
+        } catch (PDOException $exception) {
+            self::assertSame('23505', (string) $exception->getCode());
+        }
+    }
+
+    public function testRejectsMalformedCollectionAndIdentitySchemas(): void
+    {
+        foreach ([
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE', 'PRIMARY KEY (id, collection_id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE', 'PRIMARY KEY (collection_id, id) DEFERRABLE'],
+            ['collection_id VARCHAR(255) NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE', 'PRIMARY KEY (collection_id, id)'],
+            ['collection_id TEXT DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE', 'PRIMARY KEY (id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT NOT NULL UNIQUE', 'PRIMARY KEY (collection_id, id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED BY DEFAULT AS IDENTITY UNIQUE', 'PRIMARY KEY (collection_id, id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id INTEGER GENERATED ALWAYS AS IDENTITY UNIQUE', 'PRIMARY KEY (collection_id, id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY', 'PRIMARY KEY (collection_id, id)'],
+            ['collection_id TEXT NOT NULL DEFAULT \'\'', 'search_id BIGINT GENERATED ALWAYS AS IDENTITY', 'PRIMARY KEY (collection_id, id), UNIQUE (collection_id, search_id)'],
+        ] as [$collection, $identity, $primary]) {
+            $this->store->dropTable();
+            $this->pdo->exec("CREATE TABLE {$this->table} (id TEXT NOT NULL, {$collection}, {$identity}, content TEXT NOT NULL, source_type TEXT NOT NULL, source_name TEXT NOT NULL, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, embedding VECTOR(3) NOT NULL, {$primary})");
+            try {
+                new ParadeDBVectorStore($this->pdo, 3, $this->table);
+                self::fail('An incompatible schema was accepted: '.$collection.', '.$identity.', '.$primary);
+            } catch (VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+        }
+    }
+
+    public function testRejectsWrongIndexDefinitionButAllowsMissingIndexes(): void
+    {
+        $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
+        $this->pdo->exec("DROP INDEX {$this->table}_embedding_idx");
+        $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
+        foreach ([
+            "CREATE INDEX {$this->table}_bm25_idx ON {$this->table} (search_id, content)",
+            "CREATE INDEX {$this->table}_bm25_idx ON {$this->table} USING bm25 (id, content) WITH (key_field = 'id')",
+        ] as $sql) {
+            $this->pdo->exec("CREATE UNIQUE INDEX {$this->table}_legacy_unique ON {$this->table} (id)");
+            $this->pdo->exec($sql);
+            foreach (['constructor', 'setup'] as $operation) {
+                try {
+                    if ($operation === 'constructor') {
+                        new ParadeDBVectorStore($this->pdo, 3, $this->table);
+                    } else {
+                        $store->setupDatabase();
+                    }
+                    self::fail('An incompatible index with the expected name was accepted.');
+                } catch (VectorStoreException $exception) {
+                    self::assertNotSame('', $exception->getMessage());
+                }
+            }
+            $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
+            $this->pdo->exec("DROP INDEX {$this->table}_legacy_unique");
+        }
+        $store->setupDatabase();
+        $store->forCollection('A')->addDocument($this->document('needle', [1.0, 0.0, 0.0]));
+        self::assertSame('needle', $store->forCollection('A')->hybridSearch('needle', [1.0, 0.0, 0.0])[0]->id);
+    }
+
+    public function testLegacyMigrationPreservesDataAndSupportsScopedSearchAndUpsert(): void
+    {
+        $this->createLegacyTable();
+        $before = $this->legacyRows();
+        $hnsw = $this->pdo->query("SELECT oid FROM pg_class WHERE relname = '{$this->table}_embedding_idx'")->fetchColumn();
+        foreach (['constructor', 'setup'] as $operation) {
+            try {
+                if ($operation === 'constructor') {
+                    new ParadeDBVectorStore($this->pdo, 3, $this->table);
+                } else {
+                    $this->store->setupDatabase();
+                }
+                self::fail('Legacy tables must require explicit migration.');
+            } catch (VectorStoreException $exception) {
+                self::assertStringContainsString('migrat', strtolower($exception->getMessage()));
+            }
+        }
+        self::assertSame($before, $this->legacyRows());
+        $this->pdo->exec("ALTER TABLE {$this->table} RENAME CONSTRAINT {$this->table}_legacy_pk TO \"Legacy primary \"\"key\"");
+        $this->migrateLegacyTable();
+        self::assertFalse($this->pdo->inTransaction());
+        self::assertSame($before, $this->legacyRows());
+        self::assertSame($hnsw, $this->pdo->query("SELECT oid FROM pg_class WHERE relname = '{$this->table}_embedding_idx'")->fetchColumn());
+        self::assertSame([''], $this->pdo->query("SELECT DISTINCT collection_id FROM {$this->table}")->fetchAll(PDO::FETCH_COLUMN));
+        $identities = $this->pdo->query("SELECT search_id FROM {$this->table} ORDER BY search_id")->fetchAll(PDO::FETCH_COLUMN);
+        $this->migrateLegacyTable();
+        self::assertSame($identities, $this->pdo->query("SELECT search_id FROM {$this->table} ORDER BY search_id")->fetchAll(PDO::FETCH_COLUMN));
+
+        $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
+        $store->setupDatabase();
+        foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])] as $results) {
+            self::assertCount(1, $results);
+            self::assertSame("legacy'\\id", $results[0]->id);
+            self::assertEquals(['nested' => ['value' => "O'Reilly"], 'collection_id' => 'metadata-only'], $results[0]->metadata);
+        }
+        $identity = $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn();
+        $updated = $this->document("legacy'\\id", [0.8, 0.6, 0.0]);
+        $updated->content = 'legacytoken updated';
+        $store->addDocument($updated);
+        self::assertSame($identity, $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn());
+        $updated->content = 'legacytoken named';
+        $store->forCollection('named')->addDocument($updated);
+        self::assertSame('legacytoken updated', $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->content);
+        self::assertSame('legacytoken named', $store->forCollection('named')->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->content);
+    }
+
+    public function testInterruptedLegacyMigrationRollsBackSchemaIndexesAndData(): void
+    {
+        $this->createLegacyTable();
+        $before = $this->legacyRows();
+        $indexes = $this->pdo->query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{$this->table}' ORDER BY indexname")->fetchAll(PDO::FETCH_ASSOC);
+        $this->pdo->beginTransaction();
+        try {
+            $this->migrateLegacyTable();
+            self::assertTrue($this->pdo->inTransaction());
+            $this->pdo->exec('SELECT 1 / 0');
+            self::fail('The interrupted migration must fail before commit.');
+        } catch (PDOException $exception) {
+            self::assertSame('22012', (string) $exception->getCode());
+            $this->pdo->rollBack();
+        }
+        self::assertFalse($this->pdo->inTransaction());
+        self::assertSame($before, $this->legacyRows());
+        self::assertSame($indexes, $this->pdo->query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{$this->table}' ORDER BY indexname")->fetchAll(PDO::FETCH_ASSOC));
+        self::assertSame(['id', 'content', 'source_type', 'source_name', 'metadata', 'embedding'], $this->pdo->query("SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{$this->table}' ORDER BY ordinal_position")->fetchAll(PDO::FETCH_COLUMN));
+        self::assertSame("legacy'\\id", $this->pdo->query("SELECT id FROM {$this->table} WHERE content ||| 'legacytoken' ORDER BY pdb.score(id) DESC")->fetchColumn());
+    }
+
+    public function testRuntimeRoleCanUseIdentityAndSearchWithoutSequenceOrDdlPrivileges(): void
+    {
+        $role = 'test_runtime_'.bin2hex(random_bytes(8));
+        $this->pdo->exec("CREATE ROLE {$role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT");
+        try {
+            $this->pdo->exec("GRANT USAGE ON SCHEMA public TO {$role}");
+            $this->pdo->exec("GRANT SELECT, INSERT, UPDATE, DELETE ON {$this->table} TO {$role}");
+            $this->pdo->exec("SET ROLE {$role}");
+            self::assertSame($role, $this->pdo->query('SELECT current_user')->fetchColumn());
+            self::assertFalse($this->pdo->query("SELECT has_sequence_privilege(current_user, pg_get_serial_sequence('{$this->table}', 'search_id'), 'USAGE, SELECT, UPDATE')")->fetchColumn());
+            self::assertFalse($this->pdo->query("SELECT has_table_privilege(current_user, '{$this->table}', 'TRUNCATE')")->fetchColumn());
+            $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, 60, 'runtime');
+            $document = $this->document('runtime-id', [1.0, 0.0, 0.0]);
+            $document->content = 'runtimetoken initial';
+            $store->addDocument($document);
+            $identity = $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn();
+            $document->content = 'runtimetoken updated';
+            $store->addDocument($document);
+            self::assertSame($identity, $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn());
+            foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('runtimetoken', [1.0, 0.0, 0.0])] as $results) {
+                self::assertCount(1, $results);
+                self::assertSame('runtime-id', $results[0]->id);
+                self::assertSame('runtimetoken updated', $results[0]->content);
+            }
+            $store->deleteBy('manual');
+            self::assertSame([], $this->storedIds('runtime'));
+        } finally {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            $this->pdo->exec('RESET ROLE');
+            $this->pdo->exec("DROP OWNED BY {$role}");
+            $this->pdo->exec("DROP ROLE {$role}");
+        }
+    }
+
+    public function testScopedBatchFailurePreservesIdentitiesAndOuterTransaction(): void
+    {
+        $this->store->addDocument($this->document('shared', [1.0, 0.0, 0.0]));
+        $target = $this->store->forCollection('target');
+        $target->addDocument($this->document('shared', [1.0, 0.0, 0.0]));
+        $before = $this->pdo->query("SELECT collection_id, search_id, content FROM {$this->table} ORDER BY collection_id")->fetchAll(PDO::FETCH_ASSOC);
+        $this->pdo->exec("ALTER TABLE {$this->table} ADD CHECK (content <> 'rejectme')");
+        $this->pdo->beginTransaction();
+        $this->store->addDocument($this->document('outer', [1.0, 0.0, 0.0]));
+        $changed = $this->document('shared', [0.0, 1.0, 0.0]);
+        $changed->content = 'changed';
+        $bad = $this->document('bad', [1.0, 0.0, 0.0]);
+        $bad->content = 'rejectme';
+        try {
+            $target->addDocuments([$changed, $this->document('new', [1.0, 0.0, 0.0]), $bad]);
+            self::fail('The scoped batch must roll back to its savepoint.');
+        } catch (PDOException $exception) {
+            self::assertSame('23514', (string) $exception->getCode());
+        }
+        self::assertTrue($this->pdo->inTransaction());
+        self::assertSame($before, $this->pdo->query("SELECT collection_id, search_id, content FROM {$this->table} WHERE id = 'shared' ORDER BY collection_id")->fetchAll(PDO::FETCH_ASSOC));
+        self::assertSame(['shared'], $this->storedIds('target'));
+        self::assertSame(['outer', 'shared'], $this->storedIds());
+        $target->addDocument($this->document('after', [1.0, 0.0, 0.0]));
+        $this->pdo->commit();
+        self::assertSame(['after', 'shared'], $this->storedIds('target'));
+    }
+
+    public function testUpgradeFailureRestoresLegacySchemaAndCallerTransaction(): void
+    {
+        foreach ([false, true] as $outerTransaction) {
+            $this->createLegacyTable();
+            $before = $this->legacyRows();
+            $indexes = $this->pdo->query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{$this->table}' ORDER BY indexname")->fetchAll(PDO::FETCH_ASSOC);
+            $dependent = $this->table.'_refs';
+            $this->pdo->exec("CREATE TABLE {$dependent} (id TEXT REFERENCES {$this->table}(id))");
+            try {
+                if ($outerTransaction) {
+                    $this->pdo->beginTransaction();
+                    $this->pdo->exec("INSERT INTO {$dependent} VALUES (NULL)");
+                }
+                try {
+                    $this->migrateLegacyTable();
+                    self::fail('An external foreign key must prevent replacing the primary key.');
+                } catch (PDOException $exception) {
+                    self::assertSame('2BP01', (string) $exception->getCode());
+                }
+                self::assertSame($outerTransaction, $this->pdo->inTransaction());
+                self::assertSame($before, $this->legacyRows());
+                self::assertSame($indexes, $this->pdo->query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{$this->table}' ORDER BY indexname")->fetchAll(PDO::FETCH_ASSOC));
+                self::assertSame(0, (int) $this->pdo->query("SELECT count(*) FROM information_schema.columns WHERE table_name = '{$this->table}' AND column_name IN ('search_id', 'collection_id')")->fetchColumn());
+                self::assertSame("legacy'\\id", $this->pdo->query("SELECT id FROM {$this->table} WHERE content ||| 'legacytoken'")->fetchColumn());
+                if ($outerTransaction) {
+                    self::assertSame(1, (int) $this->pdo->query("SELECT count(*) FROM {$dependent}")->fetchColumn());
+                    $this->pdo->commit();
+                }
+            } finally {
+                if ($this->pdo->inTransaction()) {
+                    $this->pdo->rollBack();
+                }
+                $this->pdo->exec("DROP TABLE {$dependent}");
+            }
+        }
+    }
+
+    public function testUpgradeRejectsWrongDimensionsAndPartialSchemasWithoutChangingData(): void
+    {
+        foreach (['dimensions', 'partial', 'primary_key', 'index'] as $invalid) {
+            $this->createLegacyTable();
+            if ($invalid === 'partial') {
+                $this->pdo->exec("ALTER TABLE {$this->table} ADD collection_id TEXT NOT NULL DEFAULT ''");
+            } elseif ($invalid === 'primary_key') {
+                $this->pdo->exec("ALTER TABLE {$this->table} DROP CONSTRAINT {$this->table}_legacy_pk");
+            } elseif ($invalid === 'index') {
+                $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
+                $this->pdo->exec("CREATE INDEX {$this->table}_bm25_idx ON {$this->table} (id)");
+            }
+            $before = $this->legacyRows();
+            $columns = $this->pdo->query("SELECT column_name FROM information_schema.columns WHERE table_name = '{$this->table}' ORDER BY ordinal_position")->fetchAll(PDO::FETCH_COLUMN);
+            try {
+                ParadeDBVectorStore::upgradeToV11($this->pdo, $invalid === 'dimensions' ? 4 : 3, $this->table);
+                self::fail('An incompatible schema must not be upgraded: '.$invalid);
+            } catch (VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+            self::assertFalse($this->pdo->inTransaction());
+            self::assertSame($before, $this->legacyRows());
+            self::assertSame($columns, $this->pdo->query("SELECT column_name FROM information_schema.columns WHERE table_name = '{$this->table}' ORDER BY ordinal_position")->fetchAll(PDO::FETCH_COLUMN));
+        }
+    }
+
+    public function testUpgradeRejectsMissingTable(): void
+    {
+        $this->store->dropTable();
+        try {
+            $this->migrateLegacyTable();
+            self::fail('Upgrading must not silently provision a missing table.');
+        } catch (VectorStoreException $exception) {
+            self::assertNotSame('', $exception->getMessage());
+        }
+        self::assertFalse($this->pdo->inTransaction());
+        self::assertNull($this->pdo->query("SELECT to_regclass('{$this->table}')")->fetchColumn());
+    }
+
+    public function testUpgradeCreatesMissingBm25Index(): void
+    {
+        $this->createLegacyTable();
+        $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
+        $this->migrateLegacyTable();
+        $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
+        self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->id);
+    }
+
+    public function testUpgradeDoesNotDropIndexBelongingToAnotherTable(): void
+    {
+        $this->createLegacyTable();
+        $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
+        $other = $this->table.'_other';
+        $this->pdo->exec("CREATE TABLE {$other} (id TEXT)");
+        $this->pdo->exec("CREATE INDEX {$this->table}_bm25_idx ON {$other} (id)");
+        try {
+            try {
+                $this->migrateLegacyTable();
+                self::fail('A same-name index on another table must not be dropped.');
+            } catch (VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+            self::assertSame($other, $this->pdo->query("SELECT tablename FROM pg_indexes WHERE indexname = '{$this->table}_bm25_idx'")->fetchColumn());
+        } finally {
+            $this->pdo->exec("DROP TABLE {$other}");
+        }
+    }
+
+    public function testUpgradeResolvesTableAndIndexInTheirActualSchema(): void
+    {
+        $this->store->dropTable();
+        $schema = 'upgrade_'.bin2hex(random_bytes(6));
+        $this->pdo->exec("CREATE SCHEMA {$schema}");
+        try {
+            $this->pdo->exec("SET search_path TO {$schema}, public");
+            $this->createLegacyTable();
+            $this->pdo->exec("CREATE TABLE public.{$this->table} (id TEXT)");
+            $this->pdo->exec("CREATE INDEX {$this->table}_bm25_idx ON public.{$this->table} (id)");
+            $this->migrateLegacyTable();
+            $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
+            self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->id);
+            self::assertSame('btree', $this->pdo->query("SELECT am.amname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE c.relname = '{$this->table}_bm25_idx' AND n.nspname = 'public'")->fetchColumn());
+        } finally {
+            $this->pdo->exec("DROP TABLE IF EXISTS {$schema}.{$this->table}");
+            $this->pdo->exec('SET search_path TO public');
+            $this->pdo->exec("DROP SCHEMA {$schema}");
+        }
+    }
+
+    private function createLegacyTable(): void
+    {
+        $this->store->dropTable();
+        $this->pdo->exec("CREATE TABLE {$this->table} (id TEXT CONSTRAINT {$this->table}_legacy_pk PRIMARY KEY, content TEXT NOT NULL, source_type VARCHAR(255) NOT NULL, source_name VARCHAR(255) NOT NULL, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, embedding VECTOR(3) NOT NULL)");
+        $this->pdo->exec("CREATE INDEX {$this->table}_bm25_idx ON {$this->table} USING bm25 (id, content) WITH (key_field = 'id')");
+        $this->pdo->exec("CREATE INDEX {$this->table}_embedding_idx ON {$this->table} USING hnsw (embedding vector_cosine_ops)");
+        $statement = $this->pdo->prepare("INSERT INTO {$this->table} VALUES (:id, :content, :type, :name, CAST(:metadata AS jsonb), '[1,0,0]')");
+        $statement->execute([
+            'id' => "legacy'\\id", 'content' => "legacytoken O'Reilly\\path", 'type' => 'legacy', 'name' => 'legacy/source',
+            'metadata' => json_encode(['nested' => ['value' => "O'Reilly"], 'collection_id' => 'metadata-only'], JSON_THROW_ON_ERROR),
+        ]);
+    }
+
+    private function migrateLegacyTable(): void
+    {
+        ParadeDBVectorStore::upgradeToV11($this->pdo, 3, $this->table);
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function legacyRows(): array
+    {
+        return $this->pdo->query("SELECT id, content, source_type, source_name, metadata::text, embedding::text FROM {$this->table} ORDER BY id")->fetchAll(PDO::FETCH_ASSOC);
+    }
+
     /** @param float[] $embedding */
     private function document(string $id, array $embedding, string $sourceType = 'manual', string $sourceName = 'manual'): Document
     {
@@ -300,9 +768,11 @@ final class ParadeDBVectorStoreTest extends TestCase
     }
 
     /** @return list<string> */
-    private function storedIds(): array
+    private function storedIds(?string $collectionId = null): array
     {
-        return $this->pdo->query("SELECT id FROM {$this->table} ORDER BY id")->fetchAll(PDO::FETCH_COLUMN);
+        $statement = $this->pdo->prepare("SELECT id FROM {$this->table} WHERE collection_id = :collection_id ORDER BY id");
+        $statement->execute(['collection_id' => $collectionId ?? '']);
+        return $statement->fetchAll(PDO::FETCH_COLUMN);
     }
 
     /**
