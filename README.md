@@ -1,34 +1,91 @@
 # ParadeDB for Neuron AI
 
-Vector similarity and BM25 hybrid retrieval for [Neuron AI](https://github.com/neuron-core/neuron-ai), packaged independently from the core. Hybrid search combines cosine and lexical rankings with Reciprocal Rank Fusion (RRF), without a separate search service or PHP ParadeDB client. Optional collections separate documents within a shared table while keeping ingestion, retrieval and deletion scoped to the selected collection.
+**English** | [Français](README.fr.md)
 
-## Version Compatibility
+> Vector similarity and BM25 hybrid search in PostgreSQL for PHP RAG applications using Neuron AI.
 
-Starting with version 3.0.0, this package's major versions follow the supported Neuron AI major version:
+## Overview
 
-| ParadeDB for Neuron AI | Neuron AI |
+`semhoun/neuron-paradedb` connects [Neuron AI](https://github.com/neuron-core/neuron-ai) to ParadeDB through PDO. It combines cosine-distance semantic search and BM25 lexical search using Reciprocal Rank Fusion (RRF). Documents, embeddings and metadata share one table, without a separate search service or PHP ParadeDB client.
+
+Collections separate documents within that table. Neuron AI's typed filters apply to searches and deletions.
+
+## Technologies and Compatibility
+
+| Layer | Technology |
 | --- | --- |
-| 3.x | 3.x (`neuron-core/neuron-ai:^3.0`) |
-| 4.x | 4.x (`neuron-core/neuron-ai:^4.0`) |
+| Language | PHP `^8.1`, extensions `pdo`, `pdo_pgsql` and `curl` for Neuron |
+| RAG integration | Neuron AI `^4.0` |
+| Storage and search | ParadeDB `0.25.9-pg18`, PostgreSQL 18, extensions `vector` and `pg_search` |
+| Data access | PDO PostgreSQL, bound parameters, JSONB metadata |
+| Quality | PHPUnit, PHPStan level 6, PHP CS Fixer |
+| Continuous integration | GitHub Actions; Docker Compose test database |
 
-Choose the package major version that matches your Neuron AI installation. Minor and patch versions are released independently; their numbers do not need to match Neuron AI's. Package 4.x does not support Neuron AI 3.x.
+Since version 3.0.0, the package's major version follows Neuron AI's major version. Minor and patch versions remain independent.
 
-The `3.x` branch preserves support for Neuron AI 3.x. The `main` branch and the examples below target Neuron AI 4.x.
+| Package | Neuron AI | Branch |
+| --- | --- | --- |
+| 3.x | `^3.0` | `3.x` |
+| 4.x | `^4.0` | `main` |
 
-## Requirements
+The examples below target Neuron AI 4. Package 4.x does not support Neuron AI 3.
 
-- PHP 8.1 or newer (8.x), with `pdo`, `pdo_pgsql` and `curl` (required by Neuron).
-- Neuron AI 4.x (`neuron-core/neuron-ai:^4.0`). Neuron 3.x users should stay on this package's `3.x` branch / `3.0.0` release.
-- ParadeDB **0.25.9 / PostgreSQL 18**, including `pg_search` and `vector`. Plain PostgreSQL with pgvector alone is not sufficient.
-- Nonzero, finite embeddings with a finite, nonzero float32 squared norm and the same dimension and model for ingestion and queries. Numerically unsafe magnitudes are rejected rather than silently normalized. HNSW `vector` indexes support up to 2,000 dimensions.
+## Architecture
 
-```sh
-composer require semhoun/neuron-paradedb
+`HybridRetrieval` embeds a message's text, combines mandatory filters with AND, then calls the hybrid store. `ParadeDBVectorStore` validates documents and delegates filter compilation to `ParadeDBFilterCompiler` before executing PDO queries.
+
+- The HNSW index uses cosine distance; the BM25 index covers content and the technical key `search_id`.
+- Each hybrid branch selects at most `2 * topK` candidates, then RRF keeps the best `topK` results.
+- Collections and filters apply before ranking and limits in both branches.
+- `HybridVectorStoreInterface` extends Neuron's interface with `hybridSearch(string $query, array $embedding, ?FilterExpression $filters = null, ?int $topK = null): iterable`.
+- `HybridRetrieval::retrieve()` materializes results into an array, including results from custom lazy stores.
+
+```text
+src/
+  Retrieval/       # Hybrid retrieval strategy for Neuron AI
+  VectorStore/     # PDO store, hybrid contract and filter compilation
+tests/
+  Unit/            # Validation and contracts without a database
+  Integration/     # Queries, migrations and permissions on ParadeDB
+.github/workflows/ # PHP matrix and integration tests
+compose.yaml       # Local ParadeDB database for tests only
 ```
 
-## Create the Store
+## Installation
+
+### Prerequisites
+
+- PHP 8.1 or newer in the 8.x series, with the extensions listed above.
+- Composer 2, as used in CI.
+- A ParadeDB server with `vector` and `pg_search` installed; PostgreSQL with pgvector alone is insufficient.
+- An embeddings provider for ingestion and queries; the examples use OpenAI, but it is not required.
+- Docker with Compose for local integration tests only.
+
+From your consuming application:
+
+```bash
+composer require semhoun/neuron-paradedb:^4.0
+```
+
+### Configuration
+
+The library receives a PDO connection and does not load `.env` files. Supply these variables to the PHP process to use the examples:
+
+| Variable | Purpose |
+| --- | --- |
+| `PARADEDB_DSN` | PDO PostgreSQL DSN for the target database |
+| `PARADEDB_USER` | PostgreSQL role |
+| `PARADEDB_PASSWORD` | Password, supplied outside the repository |
+| `OPENAI_API_KEY` | OpenAI provider key, only for this example |
+| `PARADEDB_PORT` | Local Compose port, defaults to `55432` |
+
+### Initialize the Store
+
+Run provisioning explicitly with an administrative role, not on every application request:
 
 ```php
+require 'vendor/autoload.php';
+
 use Semhoun\NeuronParadeDB\VectorStore\ParadeDBVectorStore;
 
 $pdo = new PDO(
@@ -44,52 +101,24 @@ $store = new ParadeDBVectorStore(
     tableName: 'rag_documents',
     topK: 4,
     rrfK: 60,
-    collectionId: null, // Only documents without a collection.
+    collectionId: null,
 );
-
-// Explicit provisioning step, not something to run on every request.
 $store->setupDatabase();
 ```
 
-The constructor enables PDO exception mode and checks an existing table for compatibility. It does not create extensions, tables or indexes. `setupDatabase()` creates the table and HNSW/BM25 indexes idempotently, and rejects an incompatible existing embedding dimension rather than silently reusing it. It is not a schema migration tool.
+The constructor enables PDO exceptions and checks an existing table for compatibility without creating objects. `setupDatabase()` creates missing extensions, the table and indexes; it is not a migration tool. An incompatible embedding dimension is rejected.
 
-**Upgrading from 1.0?** Read [Upgrading to 1.1](#upgrading-to-11) before deploying, even if you do not use named collections.
+Table names must be single ASCII identifiers of at most 48 characters, without schema qualification. Letters and underscores are allowed initially, followed by letters, underscores or digits. Use a trusted, fixed `search_path`.
 
-Table names are single PostgreSQL identifiers (letters, digits and underscores, not starting with a digit), at most 48 characters; schema-qualified names are not accepted. Use a trusted, fixed PostgreSQL `search_path`. Values are bound parameters, including query text and source filters.
+### Ingest and Search
 
-## Optional Collections
-
-```php
-$team = new ParadeDBVectorStore(
-    pdo: $pdo,
-    dimensions: 1536,
-    collectionId: 'team-a',
-);
-$otherTeam = $team->forCollection('team-b');
-$uncollected = $team->forCollection(null);
-```
-
-`forCollection()` returns a distinct clone sharing the PDO connection, document schema and all other options, without changing the original or executing SQL. The optional `collectionId` constructor argument defaults to `null`: this scope sees **only documents without a collection**, never all collections. Explicit collection IDs must be nonempty strings; they are not trimmed or numerically normalized. `''` is rejected by the public API and reserved in SQL for the `null` scope.
-
-All inserts, upserts, searches and deletes are scoped to the store's collection. The primary key is `(collection_id, id)`, so the same document ID can exist independently in multiple collections and in the uncollected scope. The generated, globally unique `search_id` is an internal BM25 key, never a public document ID. Metadata is preserved unchanged: `ragId` and `collection_id` metadata keys do not select or override the scope. `dropTable()` remains a **global administrative operation**, including when called on a collection clone.
-
-Collection filtering happens before candidate ranking and limits in both hybrid branches. This is application-level separation, not authorization or PostgreSQL RLS: callers choose their own collection IDs. HNSW remains approximate, and BM25 statistics are shared across the table rather than independently computed per collection.
-
-| Store scope | Documents accessible through searches and deletes |
-| --- | --- |
-| Default constructor or `forCollection(null)` | Only documents without a collection |
-| `forCollection('team-a')` | Only documents in `team-a` |
-| `forCollection('team-b')` | Only documents in `team-b` |
-
-There is no all-collections search or deletion mode. A collection with no documents returns an empty search result; selecting a collection does not create a separate table or index.
-
-## Connect a RAG Agent
-
-Use the same store and embeddings provider for ingestion and retrieval. Here `$agent` is your configured instance of a class extending `NeuronAI\RAG\RAG`, with its AI provider already configured:
+The following blocks reuse the store initialized above. Use embeddings with the same dimension and model for ingestion and retrieval.
 
 ```php
+use NeuronAI\Chat\Messages\UserMessage;
 use NeuronAI\RAG\Document;
 use NeuronAI\RAG\Embeddings\OpenAIEmbeddingsProvider;
+use NeuronAI\RAG\VectorStore\SearchRequest;
 use Semhoun\NeuronParadeDB\Retrieval\HybridRetrieval;
 
 $embeddings = new OpenAIEmbeddingsProvider(
@@ -97,51 +126,62 @@ $embeddings = new OpenAIEmbeddingsProvider(
     model: 'text-embedding-3-small',
     dimensions: 1536,
 );
-
-$agent->setVectorStore($store);
-$agent->setEmbeddingsProvider($embeddings);
-$agent->setRetrieval(new HybridRetrieval($store, $embeddings));
-$agent->addDocuments([new Document('ZXQ-991 is our compact industrial sensor.')]);
-```
-
-For standalone retrieval:
-
-```php
-use NeuronAI\Chat\Messages\UserMessage;
-use NeuronAI\RAG\VectorStore\SearchRequest;
+$text = 'ZXQ-991 is a compact industrial sensor.';
+$document = (new Document($text))
+    ->setId('sensor-1')
+    ->setSourceType('manual')
+    ->setSourceName('sensor-guide')
+    ->setEmbedding($embeddings->embedText($text));
+$store->addDocument($document);
 
 $retrieval = new HybridRetrieval($store, $embeddings);
 $documents = $retrieval->retrieve(new UserMessage('ZXQ-991 sensor'));
 
-// Or vector-only search:
+// Vector-only search; topK overrides the default for this call.
 $documents = $store->search(new SearchRequest(
     embedding: $embeddings->embedText('compact sensor'),
-    topK: 8, // Per-call override; null uses the store default.
+    topK: 8,
 ));
 ```
 
-`HybridVectorStoreInterface` extends Neuron 4's `VectorStoreInterface` (`getSchema()`, `search(SearchRequest)`, `delete(FilterExpression)`, and document writes). Its additional signature is `hybridSearch(string $query, array $embedding, ?FilterExpression $filters = null, ?int $topK = null): iterable`. Custom lazy stores must implement this complete signature. `HybridRetrieval::retrieve(Message $query, ?FilterExpression $filters = null)` materializes results into the array expected by Neuron and forwards mandatory filters.
+For an existing agent extending `NeuronAI\RAG\RAG`, with its AI provider already configured:
 
-For collection-scoped retrieval, pass the same scoped store to the agent and its retrieval strategy:
+```php
+$agent->setVectorStore($store);
+$agent->setEmbeddingsProvider($embeddings);
+$agent->setRetrieval(new HybridRetrieval($store, $embeddings));
+$agent->addDocuments([new Document('Maintenance guide for the ZXQ-991 sensor.')]);
+```
+
+This repository has no application server or startup command: these components run within your PHP application.
+
+## Collections and Filters
 
 ```php
 $teamStore = $store->forCollection('team-a');
-$agent->setVectorStore($teamStore);
-$agent->setRetrieval(new HybridRetrieval($teamStore, $embeddings));
-
-// Direct hybrid search uses the same collection scope.
+$otherTeam = $store->forCollection('team-b');
+$uncollected = $store->forCollection(null);
 $query = 'ZXQ-991 sensor';
 $documents = $teamStore->hybridSearch($query, $embeddings->embedText($query));
 ```
 
-## Document Schema and Filters
+`forCollection()` returns a clone sharing PDO, the schema and options, without executing SQL or mutating the original. Pass the same collection-scoped store to the agent and its retrieval strategy.
+
+- `null` selects only documents without a collection, never all collections.
+- Collection IDs are nonempty strings without normalization; `''` is reserved in SQL for the uncollected scope.
+- The primary key `(collection_id, id)` allows the same document ID across collections. `search_id` remains a globally unique internal BM25 key.
+- Metadata keys `ragId` and `collection_id` never change the scope. There is no all-collections search or deletion mode.
+- This application-level separation is neither authorization nor PostgreSQL RLS. BM25 statistics remain shared across the table.
+- **`dropTable()` deletes the entire table and its indexes, even from a collection clone.**
+
+Declare filterable metadata in a schema. Native fields `sourceType` and `sourceName` are also available:
 
 ```php
 use NeuronAI\RAG\Schema\DocumentField;
 use NeuronAI\RAG\Schema\DocumentSchema;
 use NeuronAI\RAG\VectorStore\Filter\Filter;
 
-$store = new ParadeDBVectorStore(
+$typedStore = new ParadeDBVectorStore(
     pdo: $pdo,
     dimensions: 1536,
     collectionId: 'team-a',
@@ -151,129 +191,99 @@ $store = new ParadeDBVectorStore(
         DocumentField::strings('tags')->filterable(),
     ),
 );
-$document = (new Document('Sensor installation guide'))
-    ->setId('guide-1')
-    ->setSourceType('manual')
-    ->setSourceName('sensor-guide')
-    ->setMetadata(['tenant' => 'team-a', 'year' => 2026, 'tags' => ['sensor']])
-    ->setEmbedding($embeddings->embedText('Sensor installation guide'));
-$store->addDocument($document);
-
+$document->setMetadata(['tenant' => 'team-a', 'year' => 2026, 'tags' => ['sensor']]);
+$typedStore->addDocument($document);
 $filters = Filter::where('tenant', 'team-a')->whereGreaterThanOrEqual('year', 2025);
-$documents = $store->search(new SearchRequest($embeddings->embedText('sensor'), $filters, 4));
-$documents = $store->hybridSearch('sensor', $embeddings->embedText('sensor'), $filters, 4);
-$store->delete(Filter::where('sourceType', 'manual')->where('sourceName', 'sensor-guide'));
-
-$retrieval = new HybridRetrieval($store, $embeddings, filters: Filter::eq('tenant', 'team-a'));
-$documents = $retrieval->retrieve(new UserMessage('sensor'), Filter::containsAny('tags', ['sensor']));
+$documents = $typedStore->hybridSearch($query, $embeddings->embedText($query), $filters, 4);
+$retrieval = new HybridRetrieval($typedStore, $embeddings, filters: $filters);
+$documents = $retrieval->retrieve(new UserMessage($query), Filter::containsAny('tags', ['sensor']));
+$typedStore->delete(Filter::where('sourceType', 'manual')->where('sourceName', 'sensor-guide'));
 ```
 
-The optional final `schema` argument defaults to `DocumentSchema::default()`. Metadata remains JSON-safe and schema-less for storage; only declared filterable fields plus native `sourceType` and `sourceName` are portable filter targets. Use Neuron 4 getters/setters, not public `Document` properties. Content is supplied to the document constructor.
+The optional schema defaults to `DocumentSchema::default()`. Metadata remains stored as JSON; only declared filterable fields and native fields can be filtered. Use `Document` getters/setters, not public properties.
 
-Supported operators are `eq`, `neq`, `in`, numeric `gt/gte/lt/lte`, and `containsAny/containsAll` for string arrays, with nested `FilterGroup::allOf/anyOf` or fluent criteria. `neq` requires a required field. Null comparisons, undeclared fields, incompatible values, unknown expression implementations and **all raw filters** are rejected before executing the operation. Values and metadata keys are bound parameters; JSONB comparisons preserve scalar types.
+Operators: `eq`, `neq`, `in`, numeric `gt/gte/lt/lte`, `containsAny/containsAll` for string arrays, and `FilterGroup::allOf/anyOf` groups. `neq` requires a required field. Null comparisons, undeclared fields, incompatible values and raw filters are rejected before execution.
 
-Retrieval's own filters and incoming per-run filters are combined with AND. Every search/delete also ANDs the collection constraint; neither an OR expression nor metadata can widen that scope. Both hybrid candidate lists apply filters before ranking and limits. Requests never mutate store filters or default `topK`. The schema validates all documents and embeddings before starting a batch. It does not migrate or revalidate historical stored metadata: audit existing data before declaring new required fields or changing field types.
+Values and metadata keys are bound parameters; JSONB preserves scalar types. The collection constraint, strategy filters and per-call filters are combined with AND. An OR group cannot widen those scopes. Calls do not mutate store defaults.
 
-## Writes, Deletes and Scores
+The schema validates new documents but does not migrate or revalidate historical metadata. Audit existing data before adding a required field or changing its type.
 
-`addDocument()` and `addDocuments()` require documents with embeddings already populated. Reusing a document ID within the same collection updates its documentary fields while preserving its technical `search_id`. A batch is atomic: SQL, embedding or JSON failures roll back the whole batch. In an existing caller transaction, the store uses a savepoint and never commits the caller's work. An empty batch is a no-op. These are transactional per-document upserts, not a PostgreSQL COPY bulk loader.
+## Writes and Scores
 
-Results include the ID (as a string), content, embedding, source type/name, metadata and score. Vector scores use Neuron's cosine-distance conversion; hybrid scores are RRF values, not cosine similarity or probabilities. RRF sums `1 / (rrfK + rank)` across the two candidate lists, each limited to `2 * topK`. Final results are limited to `topK`. Larger `rrfK` reduces the relative weight of top-ranked positions. All three numeric configuration values must be positive.
+- `addDocument()` and `addDocuments()` require precomputed embeddings. An existing ID within the collection produces an upsert preserving `search_id`.
+- Batches are validated before writing and processed atomically. An existing transaction uses a savepoint without committing the caller's work. Empty batches are no-ops; this is not a PostgreSQL COPY loader.
+- Vectors must be finite, nonzero and of the exact dimension, with a finite, nonzero float32 squared norm. Unsafe magnitudes are rejected without normalization. HNSW `vector` indexes support up to 2,000 dimensions.
+- Results contain a string ID, content, embedding, sources, metadata and score. Vector scores use Neuron's cosine conversion; hybrid scores sum `1 / (rrfK + rank)` per branch and are not probabilities.
+- `dimensions`, `topK` and `rrfK` must be positive. A larger `rrfK` reduces the relative weight of top-ranked positions. HNSW remains approximate.
+- Legacy helpers `similaritySearch($embedding)`, `deleteBy($type, $name)` and `deleteBy(array)` remain adapter-specific. The array must contain nonempty source constraints with string values, combined with AND. `deleteBySource()` is deprecated; no Neuron 3 compatibility layer is loaded.
 
-```php
-$store->delete(Filter::where('sourceType', 'web')->where('sourceName', 'sensor-page'));
-$store->delete(Filter::eq('sourceType', 'web')); // This collection only.
-$store->delete(Filter::where('sourceType', 'file')->where('sourceName', 'manual.pdf'));
-```
+## Provisioning and Migration
 
-The previously published `similaritySearch($embedding)` and `deleteBy($type, $name)` / `deleteBy(['source_type' => ..., 'source_name' => ...])` helpers remain available on this adapter, not as Neuron 4 interface methods. Array filters must be nonempty and accept only string-valued source constraints combined with AND. `deleteBySource($type, $name)` remains deprecated. No Neuron 3 compatibility layer is loaded. `dropTable()` permanently deletes the entire table and its indexes; reserve it for tests or deliberate maintenance.
+### Production Permissions
 
-Migrating from this package's 3.x release requires updating Neuron and `Document` access, but no new physical table migration. The existing collection-aware SQL schema and explicit legacy `upgradeToV11()` migration are preserved.
+`setupDatabase()` runs `CREATE EXTENSION IF NOT EXISTS` for `vector` and `pg_search`, then creates the table and indexes. Use a provisioning role permitted to create those extensions, create objects in the schema and manage the table's indexes. The extensions must be installed on the server.
 
-## Database Permissions
-
-`setupDatabase()` executes these statements and therefore normally requires an administrator/provisioning connection:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_search;
-```
-
-The extensions must already be installed on the PostgreSQL server. Have an administrator run the above and provision the table/indexes using `setupDatabase()` with the desired dimension. The provisioning role needs CREATE on the target schema and ownership of the table to create its indexes. A separate runtime role only needs schema USAGE and SELECT, INSERT, UPDATE, DELETE on the provisioned table:
+After provisioning, a separate, existing application role, named `neuron_app` here, needs only:
 
 ```sql
 GRANT USAGE ON SCHEMA public TO neuron_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.rag_documents TO neuron_app;
 ```
 
-On the pinned ParadeDB 0.25.9 / PostgreSQL 18 image, the generated identity works with these table privileges alone: no sequence USAGE, SELECT or UPDATE grant is required. Integration tests exercise insert, upsert, both searches and deletion under a restricted runtime role without sequence privileges. This applies to the `GENERATED ALWAYS AS IDENTITY` column used here, not to arbitrary sequences or `SERIAL` defaults.
+Integration tests verify writes, searches and deletions without identity-sequence privileges on the pinned ParadeDB image. This applies to `GENERATED ALWAYS AS IDENTITY`, not arbitrary sequences or `SERIAL`. Do not call `setupDatabase()` with the restricted role; permission errors are propagated.
 
-Do not call `setupDatabase()` from the restricted runtime connection. Permission errors are propagated explicitly. Keep PostgreSQL credentials in your environment, never in source control.
+The repository provides no application deployment or production compilation step. `compose.yaml` is for testing only. Keep PostgreSQL credentials out of source code.
 
-## Upgrading to 1.1
+### Legacy 1.0 Tables
 
-Version 1.1 introduces optional collections through the final `collectionId` constructor argument and `forCollection()`. Existing constructor calls remain valid: omitting the collection selects only documents without a collection. Document IDs, metadata and the public search and deletion APIs retain their existing formats.
-
-**The database schema changes in 1.1, including for applications that do not use named collections.** Tables created by version 1.0 must be adapted before the new code can use them. Neither the constructor nor `setupDatabase()` performs an automatic migration; incompatible tables are rejected explicitly.
-
-The required schema changes are:
-
-- Add `collection_id TEXT NOT NULL DEFAULT ''`; existing documents belong to this uncollected scope, accessed with `collectionId: null`.
-- Replace the primary key on `id` with a non-deferrable primary key on `(collection_id, id)`, in that order.
-- Add `search_id BIGINT GENERATED ALWAYS AS IDENTITY` with global, non-deferrable uniqueness.
-- Rebuild the BM25 index on `(search_id, content)` with `key_field = 'search_id'`. Document fields and the HNSW index can be preserved.
-
-Run the explicit upgrade method with a table-owner/provisioning connection **before constructing the store**. The constructor intentionally rejects the old schema, so the upgrade method is static:
+The schema introduced in 1.1 is required, even without named collections. The constructor and `setupDatabase()` reject legacy tables without migrating them. Run this static method **before constructing the store**, using a table-owner connection and the existing dimension:
 
 ```php
-use Semhoun\NeuronParadeDB\VectorStore\ParadeDBVectorStore;
-
-ParadeDBVectorStore::upgradeToV11(
-    pdo: $pdo,
-    dimensions: 1536, // Must match the existing embedding dimension.
-    tableName: 'rag_documents',
-);
-
-$store = new ParadeDBVectorStore($pdo, dimensions: 1536, tableName: 'rag_documents');
+ParadeDBVectorStore::upgradeToV11(pdo: $pdo, dimensions: 1536, tableName: 'rag_documents');
 ```
 
-`upgradeToV11()` preserves existing documents and the HNSW index, detects the actual primary-key constraint name, and rebuilds BM25 using the new technical key. It operates on the whole table, not a single collection. Repeating it on an already upgraded table leaves its data and existing indexes unchanged; a missing BM25 index is created. Missing tables and incompatible or partially migrated schemas are rejected; this is not a general-purpose schema repair tool.
+The migration adds `collection_id TEXT NOT NULL DEFAULT ''`, replaces the primary key with `(collection_id, id)`, adds a unique `search_id BIGINT GENERATED ALWAYS AS IDENTITY` and rebuilds BM25 on `(search_id, content)`. Documents, metadata and the HNSW index are preserved; existing documents belong to the `null` scope.
 
-The upgrade runs in a transaction under an exclusive table lock. Any failure rolls back its schema and index changes. If the connection already has a transaction, the method uses a savepoint and leaves the caller responsible for committing or rolling back; locks can remain until that transaction ends. External dependencies that prevent replacing the old primary key cause an error rather than being removed with `CASCADE`.
+The operation is transactional with an exclusive lock, or uses a savepoint within an existing transaction. Locks can then last until that transaction ends. Errors roll back changes; external dependencies are never removed with `CASCADE`. An already migrated table remains unchanged except for a missing BM25 index being created. Missing or partially migrated tables are rejected.
 
-Back up the database, test the upgrade and rollback on a copy, and allow a maintenance window for locking and index reconstruction. Stop application access during the transition and do not run versions 1.0 and 1.1 against the same table concurrently. Do not run this administrative method from a restricted runtime connection or on each request.
+Back up the database, test migration and rollback on a copy, then schedule maintenance without application access. Do not mix versions 1.0 and 1.1 against the same table or run this migration on every request. New installations use `setupDatabase()` directly.
 
-For a new installation, `setupDatabase()` creates the 1.1 schema directly; no migration is needed.
+Moving from package 3.x to 4.x requires updating Neuron and `Document` access, but no new physical migration.
 
-## Development
+## Development and Testing
 
-```sh
+```bash
+git clone https://github.com/semhoun/neuron-paradedb.git
+cd neuron-paradedb
 composer install
 composer validate --strict
 composer test
 composer analyse
 composer style:check
+```
+
+The three unit test files cover validation, filter compilation and hybrid retrieval without a database or API key. The integration test file covers schema, scores, collections, filters, upserts, transactions/savepoints, migrations and restricted permissions.
+
+For local integration tests, use only a disposable database with administrative privileges. Compose exposes it on localhost. Export `PARADEDB_USER` and `PARADEDB_PASSWORD` using the test values defined in `compose.yaml`, then run:
+
+```bash
 docker compose up -d --wait
-PARADEDB_DSN='pgsql:host=127.0.0.1;port=55432;dbname=neuron_paradedb_test' \
-PARADEDB_USER=neuron_test PARADEDB_PASSWORD=neuron_test composer test:integration
+export PARADEDB_DSN="pgsql:host=127.0.0.1;port=${PARADEDB_PORT:-55432};dbname=neuron_paradedb_test"
+composer test:integration
 docker compose down -v
 ```
 
-The Compose database is test-only, bound to localhost; override `PARADEDB_PORT` if needed. Integration tests use their own temporary tables and a temporary restricted role; run them only against a disposable database with administrative privileges, as provided by Compose. They are skipped when `PARADEDB_DSN` is unset. Unit tests require no database or external API keys.
+Tests create and remove temporary tables and a restricted role. Without `PARADEDB_DSN`, they are skipped. The final command removes the containers and associated volumes.
 
-CI covers PHP 8.1 through 8.5, latest compatible dependencies and a lowest-dependency PHP 8.1 job. A separate integration job runs against the pinned `paradedb/paradedb:0.25.9-pg18` image. Later ParadeDB releases are not yet qualified.
+[CI](.github/workflows/tests.yml) configures PHP 8.1 through 8.5, including a PHP 8.1 job with lowest dependencies. Integration uses PHP 8.3 and `paradedb/paradedb:0.25.9-pg18`. Previously recorded local validation used PHP 8.5.10, Neuron AI 4.0.0, PostgreSQL 18.6 and pgvector 0.8.4. Later ParadeDB versions are not yet qualified.
 
-Validated compatibility:
+## Contributing
 
-| Component | Tested versions |
-| --- | --- |
-| PHP | 8.5.10 locally; 8.1 through 8.5 configured in CI |
-| Neuron AI | 4.0.0 (stable, local validation) |
-| ParadeDB / pg_search | 0.25.9 |
-| PostgreSQL / pgvector | 18.6 / 0.8.4 |
-
-Integration coverage includes typed portable filters, nested scopes, request limits, repeated document IDs across collections, filtering before candidate limits, scoped deletes and upserts, identity stability, transaction/savepoint rollback, legacy migration and its rollback, and restricted runtime permissions. Earlier Neuron 3.x validation belongs to the preserved 3.x release, not the current compatibility claim.
+1. Fork the repository and create a dedicated branch.
+2. Add relevant tests in `tests/Unit` or `tests/Integration`.
+3. Run the validation commands above, and integration tests for SQL changes.
+4. Use `composer style` to apply formatting, then open a pull request describing the change.
 
 ## License
 
-MIT licensed.
+[MIT](LICENSE). Copyright 2026 Nathanael (semhoun).
