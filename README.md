@@ -2,10 +2,23 @@
 
 Vector similarity and BM25 hybrid retrieval for [Neuron AI](https://github.com/neuron-core/neuron-ai), packaged independently from the core. Hybrid search combines cosine and lexical rankings with Reciprocal Rank Fusion (RRF), without a separate search service or PHP ParadeDB client. Optional collections separate documents within a shared table while keeping ingestion, retrieval and deletion scoped to the selected collection.
 
+## Version Compatibility
+
+Starting with version 3.0.0, this package's major versions follow the supported Neuron AI major version:
+
+| ParadeDB for Neuron AI | Neuron AI |
+| --- | --- |
+| 3.x | 3.x (`neuron-core/neuron-ai:^3.0`) |
+| 4.x | 4.x (`neuron-core/neuron-ai:^4.0`) |
+
+Choose the package major version that matches your Neuron AI installation. Minor and patch versions are released independently; their numbers do not need to match Neuron AI's. Package 4.x does not support Neuron AI 3.x.
+
+The `3.x` branch preserves support for Neuron AI 3.x. The `main` branch and the examples below target Neuron AI 4.x.
+
 ## Requirements
 
-- PHP 8.1 or newer (8.x), with `pdo` and `pdo_pgsql`.
-- Neuron AI 3.x.
+- PHP 8.1 or newer (8.x), with `pdo`, `pdo_pgsql` and `curl` (required by Neuron).
+- Neuron AI 4.x (`neuron-core/neuron-ai:^4.0`). Neuron 3.x users should stay on this package's `3.x` branch / `3.0.0` release.
 - ParadeDB **0.25.9 / PostgreSQL 18**, including `pg_search` and `vector`. Plain PostgreSQL with pgvector alone is not sufficient.
 - Nonzero, finite embeddings with a finite, nonzero float32 squared norm and the same dimension and model for ingestion and queries. Numerically unsafe magnitudes are rejected rather than silently normalized. HNSW `vector` indexes support up to 2,000 dimensions.
 
@@ -56,7 +69,7 @@ $otherTeam = $team->forCollection('team-b');
 $uncollected = $team->forCollection(null);
 ```
 
-`forCollection()` returns a distinct clone sharing the PDO connection and all other options, without changing the original or executing SQL. The optional final constructor argument defaults to `null`: this scope sees **only documents without a collection**, never all collections. Explicit collection IDs must be nonempty strings; they are not trimmed or numerically normalized. `''` is rejected by the public API and reserved in SQL for the `null` scope.
+`forCollection()` returns a distinct clone sharing the PDO connection, document schema and all other options, without changing the original or executing SQL. The optional `collectionId` constructor argument defaults to `null`: this scope sees **only documents without a collection**, never all collections. Explicit collection IDs must be nonempty strings; they are not trimmed or numerically normalized. `''` is rejected by the public API and reserved in SQL for the `null` scope.
 
 All inserts, upserts, searches and deletes are scoped to the store's collection. The primary key is `(collection_id, id)`, so the same document ID can exist independently in multiple collections and in the uncollected scope. The generated, globally unique `search_id` is an internal BM25 key, never a public document ID. Metadata is preserved unchanged: `ragId` and `collection_id` metadata keys do not select or override the scope. `dropTable()` remains a **global administrative operation**, including when called on a collection clone.
 
@@ -95,15 +108,19 @@ For standalone retrieval:
 
 ```php
 use NeuronAI\Chat\Messages\UserMessage;
+use NeuronAI\RAG\VectorStore\SearchRequest;
 
 $retrieval = new HybridRetrieval($store, $embeddings);
 $documents = $retrieval->retrieve(new UserMessage('ZXQ-991 sensor'));
 
 // Or vector-only search:
-$documents = $store->similaritySearch($embeddings->embedText('compact sensor'));
+$documents = $store->search(new SearchRequest(
+    embedding: $embeddings->embedText('compact sensor'),
+    topK: 8, // Per-call override; null uses the store default.
+));
 ```
 
-`HybridVectorStoreInterface` extends Neuron's `VectorStoreInterface`; its `hybridSearch(string $query, array $embedding): iterable` also permits custom lazy stores. `HybridRetrieval` materializes the results into the array expected by Neuron.
+`HybridVectorStoreInterface` extends Neuron 4's `VectorStoreInterface` (`getSchema()`, `search(SearchRequest)`, `delete(FilterExpression)`, and document writes). Its additional signature is `hybridSearch(string $query, array $embedding, ?FilterExpression $filters = null, ?int $topK = null): iterable`. Custom lazy stores must implement this complete signature. `HybridRetrieval::retrieve(Message $query, ?FilterExpression $filters = null)` materializes results into the array expected by Neuron and forwards mandatory filters.
 
 For collection-scoped retrieval, pass the same scoped store to the agent and its retrieval strategy:
 
@@ -117,6 +134,46 @@ $query = 'ZXQ-991 sensor';
 $documents = $teamStore->hybridSearch($query, $embeddings->embedText($query));
 ```
 
+## Document Schema and Filters
+
+```php
+use NeuronAI\RAG\Schema\DocumentField;
+use NeuronAI\RAG\Schema\DocumentSchema;
+use NeuronAI\RAG\VectorStore\Filter\Filter;
+
+$store = new ParadeDBVectorStore(
+    pdo: $pdo,
+    dimensions: 1536,
+    collectionId: 'team-a',
+    schema: DocumentSchema::of(
+        DocumentField::string('tenant')->required()->filterable(),
+        DocumentField::integer('year')->filterable(),
+        DocumentField::strings('tags')->filterable(),
+    ),
+);
+$document = (new Document('Sensor installation guide'))
+    ->setId('guide-1')
+    ->setSourceType('manual')
+    ->setSourceName('sensor-guide')
+    ->setMetadata(['tenant' => 'team-a', 'year' => 2026, 'tags' => ['sensor']])
+    ->setEmbedding($embeddings->embedText('Sensor installation guide'));
+$store->addDocument($document);
+
+$filters = Filter::where('tenant', 'team-a')->whereGreaterThanOrEqual('year', 2025);
+$documents = $store->search(new SearchRequest($embeddings->embedText('sensor'), $filters, 4));
+$documents = $store->hybridSearch('sensor', $embeddings->embedText('sensor'), $filters, 4);
+$store->delete(Filter::where('sourceType', 'manual')->where('sourceName', 'sensor-guide'));
+
+$retrieval = new HybridRetrieval($store, $embeddings, filters: Filter::eq('tenant', 'team-a'));
+$documents = $retrieval->retrieve(new UserMessage('sensor'), Filter::containsAny('tags', ['sensor']));
+```
+
+The optional final `schema` argument defaults to `DocumentSchema::default()`. Metadata remains JSON-safe and schema-less for storage; only declared filterable fields plus native `sourceType` and `sourceName` are portable filter targets. Use Neuron 4 getters/setters, not public `Document` properties. Content is supplied to the document constructor.
+
+Supported operators are `eq`, `neq`, `in`, numeric `gt/gte/lt/lte`, and `containsAny/containsAll` for string arrays, with nested `FilterGroup::allOf/anyOf` or fluent criteria. `neq` requires a required field. Null comparisons, undeclared fields, incompatible values, unknown expression implementations and **all raw filters** are rejected before executing the operation. Values and metadata keys are bound parameters; JSONB comparisons preserve scalar types.
+
+Retrieval's own filters and incoming per-run filters are combined with AND. Every search/delete also ANDs the collection constraint; neither an OR expression nor metadata can widen that scope. Both hybrid candidate lists apply filters before ranking and limits. Requests never mutate store filters or default `topK`. The schema validates all documents and embeddings before starting a batch. It does not migrate or revalidate historical stored metadata: audit existing data before declaring new required fields or changing field types.
+
 ## Writes, Deletes and Scores
 
 `addDocument()` and `addDocuments()` require documents with embeddings already populated. Reusing a document ID within the same collection updates its documentary fields while preserving its technical `search_id`. A batch is atomic: SQL, embedding or JSON failures roll back the whole batch. In an existing caller transaction, the store uses a savepoint and never commits the caller's work. An empty batch is a no-op. These are transactional per-document upserts, not a PostgreSQL COPY bulk loader.
@@ -124,12 +181,14 @@ $documents = $teamStore->hybridSearch($query, $embeddings->embedText($query));
 Results include the ID (as a string), content, embedding, source type/name, metadata and score. Vector scores use Neuron's cosine-distance conversion; hybrid scores are RRF values, not cosine similarity or probabilities. RRF sums `1 / (rrfK + rank)` across the two candidate lists, each limited to `2 * topK`. Final results are limited to `topK`. Larger `rrfK` reduces the relative weight of top-ranked positions. All three numeric configuration values must be positive.
 
 ```php
-$store->deleteBy('web', 'https://example.com/page');
-$store->deleteBy('web'); // Documents of this source type in this collection only.
-$store->deleteBy(['source_type' => 'file', 'source_name' => 'manual.pdf']);
+$store->delete(Filter::where('sourceType', 'web')->where('sourceName', 'sensor-page'));
+$store->delete(Filter::eq('sourceType', 'web')); // This collection only.
+$store->delete(Filter::where('sourceType', 'file')->where('sourceName', 'manual.pdf'));
 ```
 
-Array filters are combined with AND and accept only string-valued `source_type` and `source_name`. Empty or unknown filters are rejected to prevent accidental mass deletion. The string form matches Neuron 3.x's actual `DeleteByInterface`. `deleteBySource($type, $name)` remains available but deprecated. `dropTable()` permanently deletes the entire table and its indexes; reserve it for tests or deliberate maintenance.
+The previously published `similaritySearch($embedding)` and `deleteBy($type, $name)` / `deleteBy(['source_type' => ..., 'source_name' => ...])` helpers remain available on this adapter, not as Neuron 4 interface methods. Array filters must be nonempty and accept only string-valued source constraints combined with AND. `deleteBySource($type, $name)` remains deprecated. No Neuron 3 compatibility layer is loaded. `dropTable()` permanently deletes the entire table and its indexes; reserve it for tests or deliberate maintenance.
+
+Migrating from this package's 3.x release requires updating Neuron and `Document` access, but no new physical table migration. The existing collection-aware SQL schema and explicit legacy `upgradeToV11()` migration are preserved.
 
 ## Database Permissions
 
@@ -208,12 +267,12 @@ Validated compatibility:
 
 | Component | Tested versions |
 | --- | --- |
-| PHP | 8.1, 8.2, 8.3, 8.4, 8.5 (CI quality/unit tests) |
-| Neuron AI | 3.15.27 (lowest resolved dependencies), 3.16.13, 3.17.0 (local validation) |
+| PHP | 8.5.10 locally; 8.1 through 8.5 configured in CI |
+| Neuron AI | 4.0.0 (stable, local validation) |
 | ParadeDB / pg_search | 0.25.9 |
 | PostgreSQL / pgvector | 18.6 / 0.8.4 |
 
-The collection implementation was also validated locally with PHP 8.5.10 and Neuron AI 3.17.0 against the pinned database image. Integration coverage includes repeated document IDs across collections, filtering before candidate limits, scoped deletes and upserts, identity stability, transaction/savepoint rollback, legacy migration and its rollback, and restricted runtime permissions.
+Integration coverage includes typed portable filters, nested scopes, request limits, repeated document IDs across collections, filtering before candidate limits, scoped deletes and upserts, identity stability, transaction/savepoint rollback, legacy migration and its rollback, and restricted runtime permissions. Earlier Neuron 3.x validation belongs to the preserved 3.x release, not the current compatibility claim.
 
 ## License
 

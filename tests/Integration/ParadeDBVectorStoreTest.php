@@ -4,7 +4,12 @@ declare(strict_types=1);
 
 namespace Semhoun\NeuronParadeDB\Tests\Integration;
 
-use JsonException;
+use NeuronAI\RAG\Schema\DocumentSchemaException;
+use NeuronAI\RAG\Schema\DocumentField;
+use NeuronAI\RAG\Schema\DocumentSchema;
+use NeuronAI\RAG\VectorStore\SearchRequest;
+use NeuronAI\RAG\VectorStore\Filter\Filter;
+use NeuronAI\RAG\VectorStore\Filter\FilterGroup;
 use NeuronAI\Exceptions\VectorStoreException;
 use NeuronAI\RAG\Document;
 use PDO;
@@ -44,6 +49,71 @@ final class ParadeDBVectorStoreTest extends TestCase
         }
     }
 
+    public function testPortableFiltersPreserveTypesAndScopeAcrossSearchAndDelete(): void
+    {
+        $schema = DocumentSchema::of(
+            DocumentField::string('tenant')->required()->filterable(),
+            DocumentField::integer('year')->filterable(),
+            DocumentField::float('weight')->filterable(),
+            DocumentField::boolean('active')->filterable(),
+            DocumentField::strings('tags')->filterable(),
+        );
+        $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 10, collectionId: 'A', schema: $schema);
+        $payload = "O'Reilly'; DROP TABLE ignored; --";
+        $documents = [
+            $this->document('a', [1, 0, 0], 'web', $payload)->setMetadata(['tenant' => '01', 'year' => 2020, 'weight' => 1.5, 'active' => false, 'tags' => ['red', 'blue']]),
+            $this->document('b', [0.8, 0.6, 0], 'file', 'two')->setMetadata(['tenant' => '1', 'year' => 2025, 'weight' => 2, 'active' => true, 'tags' => ['blue']]),
+            $this->document('c', [0, 1, 0])->setMetadata(['tenant' => '01', 'year' => null, 'active' => null]),
+        ];
+        foreach ([$store, $store->forCollection('B'), $store->forCollection(null)] as $scoped) {
+            $scoped->addDocuments($documents);
+        }
+        foreach ([
+            [Filter::eq('tenant', '01'), ['a', 'c']],
+            [Filter::neq('tenant', '01'), ['b']],
+            [Filter::in('tenant', ['01', '1']), ['a', 'b', 'c']],
+            [Filter::eq('active', false), ['a']],
+            [Filter::gt('year', 2020), ['b']],
+            [Filter::gte('year', 2020), ['a', 'b']],
+            [Filter::lt('year', 2025), ['a']],
+            [Filter::lte('year', 2025), ['a', 'b']],
+            [Filter::eq('weight', 2.0), ['b']],
+            [Filter::containsAny('tags', ['red', 'blue']), ['a', 'b']],
+            [Filter::containsAll('tags', ['red', 'blue']), ['a']],
+            [Filter::eq('sourceName', $payload), ['a']],
+            [FilterGroup::allOf(Filter::eq('tenant', '01'), FilterGroup::anyOf(Filter::eq('sourceType', 'web'), Filter::eq('sourceName', 'two'))), ['a']],
+        ] as [$filter, $expected]) {
+            foreach ([$store->search(new SearchRequest([1, 0, 0], $filter)), $store->hybridSearch('nonexistentlexeme', [1, 0, 0], $filter)] as $results) {
+                self::assertSame($expected, array_map(static fn (Document $document): string => (string) $document->getId(), $results));
+            }
+        }
+        self::assertCount(1, $store->search(new SearchRequest([1, 0, 0], topK: 1)));
+        self::assertCount(3, $store->search(new SearchRequest([1, 0, 0])));
+        $store->delete(FilterGroup::anyOf(Filter::eq('sourceName', $payload), Filter::eq('tenant', '1')));
+        self::assertSame(['c'], $this->storedIds('A'));
+        self::assertSame(['a', 'b', 'c'], $this->storedIds('B'));
+        self::assertSame(['a', 'b', 'c'], $this->storedIds());
+    }
+
+    public function testMetadataFiltersApplyBeforeCandidateRankingInBothHybridBranches(): void
+    {
+        $schema = DocumentSchema::of(DocumentField::string('tenant')->required()->filterable());
+        $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, collectionId: 'A', schema: $schema);
+        for ($i = 0; $i < 8; ++$i) {
+            $store->addDocument($this->withContent($this->document('outside-'.$i, [1, 0, 0]), 'needle')->setMetadata(['tenant' => 'other']));
+        }
+        $store->addDocuments([
+            $this->document('local-vector', [0.8, 0.6, 0])->setMetadata(['tenant' => 'target']),
+            $this->withContent($this->document('local-lexical', [0, 1, 0]), 'needle '.str_repeat('padding ', 100))->setMetadata(['tenant' => 'target']),
+        ]);
+        $filter = Filter::eq('tenant', 'target');
+        $results = $store->hybridSearch('needle', [1, 0, 0], $filter);
+        self::assertSame(['local-lexical', 'local-vector'], array_map(static fn (Document $document): string => (string) $document->getId(), $results));
+        self::assertEqualsWithDelta(1 / 61 + 1 / 62, $results[0]->getScore(), 0.00000001);
+        self::assertEqualsWithDelta(1 / 61, $results[1]->getScore(), 0.00000001);
+        self::assertSame('local-vector', $store->search(new SearchRequest([1, 0, 0], $filter, 1))[0]->getId());
+    }
+
     public function testSetupIsIdempotentAndPreservesDocuments(): void
     {
         $this->store->addDocument($this->document('retained', [1.0, 0.0, 0.0]));
@@ -76,23 +146,23 @@ final class ParadeDBVectorStoreTest extends TestCase
     {
         $document = $this->document("id'\\special", [0.0, 1.0, 0.0]);
         $this->store->addDocument($document);
-        $document->content = "uniquetoken O'Reilly \\ path \"quoted\"\nsecond line";
-        $document->sourceType = "web' OR '1'='1";
-        $document->sourceName = "name'; DROP TABLE example; --";
-        $document->embedding = [1.0, 0.0, 0.0];
-        $document->metadata = ['nested' => ['quote' => "O'Reilly", 'enabled' => true, 'nothing' => null], 'list' => [1, 2]];
+        $document = $this->withContent($document, "uniquetoken O'Reilly \\ path \"quoted\"\nsecond line");
+        $document->setSourceType("web' OR '1'='1");
+        $document->setSourceName("name'; DROP TABLE example; --");
+        $document->setEmbedding([1.0, 0.0, 0.0]);
+        $document->setMetadata(['nested' => ['quote' => "O'Reilly", 'enabled' => true, 'nothing' => null], 'list' => [1, 2]]);
         self::assertSame($this->store, $this->store->addDocument($document));
-        self::assertSame([(string) $document->id], $this->storedIds());
+        self::assertSame([(string) $document->getId()], $this->storedIds());
 
         foreach ([$this->store->similaritySearch([1.0, 0.0, 0.0]), $this->store->hybridSearch('uniquetoken', [1.0, 0.0, 0.0])] as $results) {
             $results = $this->documents($results);
             self::assertCount(1, $results);
-            self::assertSame($document->id, $results[0]->getId());
-            self::assertSame($document->content, $results[0]->getContent());
-            self::assertSame($document->sourceType, $results[0]->getSourceType());
-            self::assertSame($document->sourceName, $results[0]->getSourceName());
-            self::assertEquals($document->metadata, $results[0]->metadata);
-            self::assertEquals($document->embedding, $results[0]->getEmbedding());
+            self::assertSame($document->getId(), $results[0]->getId());
+            self::assertSame($document->getContent(), $results[0]->getContent());
+            self::assertSame($document->getSourceType(), $results[0]->getSourceType());
+            self::assertSame($document->getSourceName(), $results[0]->getSourceName());
+            self::assertEquals($document->getMetadata(), $results[0]->getMetadata());
+            self::assertEquals($document->getEmbedding(), $results[0]->getEmbedding());
         }
     }
 
@@ -101,9 +171,9 @@ final class ParadeDBVectorStoreTest extends TestCase
         $existing = $this->document('existing', [1.0, 0.0, 0.0]);
         $this->store->addDocument($existing);
         $this->pdo->exec("ALTER TABLE {$this->table} ADD CONSTRAINT reject_bad CHECK (content <> 'rejectme')");
-        $existing->content = 'changed';
+        $existing = $this->withContent($existing, 'changed');
         $bad = $this->document('bad', [0.0, 1.0, 0.0]);
-        $bad->content = 'rejectme';
+        $bad = $this->withContent($bad, 'rejectme');
         try {
             $this->store->addDocuments([$existing, $this->document('new', [1.0, 0.0, 0.0]), $bad]);
             self::fail('The database constraint must reject the last document.');
@@ -112,17 +182,17 @@ final class ParadeDBVectorStoreTest extends TestCase
         }
         self::assertFalse($this->pdo->inTransaction());
         self::assertSame(['existing'], $this->storedIds());
-        self::assertSame('existing', $this->documents($this->store->similaritySearch([1.0, 0.0, 0.0]))[0]->content);
+        self::assertSame('existing', $this->documents($this->store->similaritySearch([1.0, 0.0, 0.0]))[0]->getContent());
     }
 
     public function testJsonFailureRollsBackEntireBatch(): void
     {
         $bad = $this->document('bad', [0.0, 1.0, 0.0]);
-        $bad->metadata = ['invalid_utf8' => "\xB1\x31"];
+        $bad->setMetadata(['invalid_utf8' => "\xB1\x31"]);
         try {
             $this->store->addDocuments([$this->document('good', [1.0, 0.0, 0.0]), $bad]);
             self::fail('Invalid UTF-8 metadata must fail JSON encoding.');
-        } catch (JsonException $exception) {
+        } catch (DocumentSchemaException $exception) {
             self::assertSame(JSON_ERROR_UTF8, $exception->getCode());
         }
         self::assertFalse($this->pdo->inTransaction());
@@ -144,11 +214,11 @@ final class ParadeDBVectorStoreTest extends TestCase
         $this->pdo->beginTransaction();
         $this->store->addDocument($this->document('outer', [1.0, 0.0, 0.0]));
         $bad = $this->document('bad', [0.0, 1.0, 0.0]);
-        $bad->metadata = ['invalid_utf8' => "\xB1\x31"];
+        $bad->setMetadata(['invalid_utf8' => "\xB1\x31"]);
         try {
             $this->store->addDocuments([$this->document('inner', [1.0, 0.0, 0.0]), $bad]);
             self::fail('Invalid JSON must reject the batch.');
-        } catch (JsonException $exception) {
+        } catch (DocumentSchemaException $exception) {
             self::assertSame(JSON_ERROR_UTF8, $exception->getCode());
         }
         self::assertTrue($this->pdo->inTransaction());
@@ -163,7 +233,7 @@ final class ParadeDBVectorStoreTest extends TestCase
         $this->pdo->beginTransaction();
         $this->store->addDocument($this->document('outer', [1.0, 0.0, 0.0]));
         $bad = $this->document('bad', [0.0, 1.0, 0.0]);
-        $bad->content = 'rejectme';
+        $bad = $this->withContent($bad, 'rejectme');
         try {
             $this->store->addDocuments([$this->document('inner', [1.0, 0.0, 0.0]), $bad]);
             self::fail('The database constraint must reject the batch.');
@@ -186,10 +256,10 @@ final class ParadeDBVectorStoreTest extends TestCase
         ]);
         $results = $this->documents($this->store->similaritySearch([1.0, 0.0, 0.0]));
         self::assertCount(2, $results);
-        self::assertSame('nearest', $results[0]->id);
-        self::assertSame('middle', $results[1]->id);
-        self::assertEqualsWithDelta(1.0, $results[0]->score, 0.000001);
-        self::assertEqualsWithDelta(0.8, $results[1]->score, 0.000001);
+        self::assertSame('nearest', $results[0]->getId());
+        self::assertSame('middle', $results[1]->getId());
+        self::assertEqualsWithDelta(1.0, $results[0]->getScore(), 0.000001);
+        self::assertEqualsWithDelta(0.8, $results[1]->getScore(), 0.000001);
     }
 
     public function testHybridSearchFusesExactRanksAndRespectsLimitAndRrfK(): void
@@ -203,10 +273,10 @@ final class ParadeDBVectorStoreTest extends TestCase
             $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, $rrfK);
             $results = $this->documents($store->hybridSearch('uniquetoken', [1.0, 0.0, 0.0]));
             self::assertCount(2, $results);
-            self::assertSame('uniquetoken', $results[0]->id);
-            self::assertSame('semantic', $results[1]->id);
-            self::assertEqualsWithDelta(1 / ($rrfK + 2) + 1 / ($rrfK + 1), $results[0]->score, 0.00000001);
-            self::assertEqualsWithDelta(1 / ($rrfK + 1), $results[1]->score, 0.00000001);
+            self::assertSame('uniquetoken', $results[0]->getId());
+            self::assertSame('semantic', $results[1]->getId());
+            self::assertEqualsWithDelta(1 / ($rrfK + 2) + 1 / ($rrfK + 1), $results[0]->getScore(), 0.00000001);
+            self::assertEqualsWithDelta(1 / ($rrfK + 1), $results[1]->getScore(), 0.00000001);
         }
     }
 
@@ -219,10 +289,10 @@ final class ParadeDBVectorStoreTest extends TestCase
         ]);
         $results = $this->documents($this->store->hybridSearch('nonexistentlexeme', [1.0, 0.0, 0.0]));
         self::assertCount(2, $results);
-        self::assertSame('nearest', $results[0]->id);
-        self::assertSame('middle', $results[1]->id);
-        self::assertEqualsWithDelta(1 / 61, $results[0]->score, 0.00000001);
-        self::assertEqualsWithDelta(1 / 62, $results[1]->score, 0.00000001);
+        self::assertSame('nearest', $results[0]->getId());
+        self::assertSame('middle', $results[1]->getId());
+        self::assertEqualsWithDelta(1 / 61, $results[0]->getScore(), 0.00000001);
+        self::assertEqualsWithDelta(1 / 62, $results[1]->getScore(), 0.00000001);
     }
 
     public function testDeleteSupportsNativeArrayAndDeprecatedForms(): void
@@ -291,7 +361,7 @@ final class ParadeDBVectorStoreTest extends TestCase
         $this->store->addDocument($this->document('retained', [1.0, 0.0, 0.0]));
         $results = $this->documents($this->store->hybridSearch("O'Reilly'; DROP TABLE {$this->table}; --", [1.0, 0.0, 0.0]));
         self::assertCount(1, $results);
-        self::assertSame('retained', $results[0]->id);
+        self::assertSame('retained', $results[0]->getId());
         self::assertSame(['retained'], $this->storedIds());
     }
 
@@ -301,16 +371,16 @@ final class ParadeDBVectorStoreTest extends TestCase
         foreach ($collections as $offset => $collection) {
             $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, 60, $collection);
             $document = $this->document('same-public-id', [1.0, 0.0, 0.0]);
-            $document->content = 'sharedtoken content '.$offset;
-            $document->metadata = ['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset];
+            $document = $this->withContent($document, 'sharedtoken content '.$offset);
+            $document->setMetadata(['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset]);
             $store->addDocument($document);
         }
         $identities = $this->pdo->query("SELECT collection_id, search_id FROM {$this->table} ORDER BY collection_id")->fetchAll(PDO::FETCH_KEY_PAIR);
         self::assertCount(count($collections), array_unique($identities));
 
         $changed = $this->document('same-public-id', [0.8, 0.6, 0.0]);
-        $changed->content = 'sharedtoken updated';
-        $changed->metadata = ['updated' => true];
+        $changed = $this->withContent($changed, 'sharedtoken updated');
+        $changed->setMetadata(['updated' => true]);
         $this->store->forCollection('A')->addDocument($changed);
         self::assertSame($identities, $this->pdo->query("SELECT collection_id, search_id FROM {$this->table} ORDER BY collection_id")->fetchAll(PDO::FETCH_KEY_PAIR));
 
@@ -318,12 +388,12 @@ final class ParadeDBVectorStoreTest extends TestCase
             $store = $this->store->forCollection('unused')->forCollection($collection);
             foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('sharedtoken', [1.0, 0.0, 0.0])] as $results) {
                 self::assertCount(1, $results);
-                self::assertSame('same-public-id', $results[0]->id);
-                self::assertSame($collection === 'A' ? $changed->content : 'sharedtoken content '.$offset, $results[0]->content);
-                self::assertEquals($collection === 'A' ? $changed->metadata : ['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset], $results[0]->metadata);
+                self::assertSame('same-public-id', $results[0]->getId());
+                self::assertSame($collection === 'A' ? $changed->getContent() : 'sharedtoken content '.$offset, $results[0]->getContent());
+                self::assertEquals($collection === 'A' ? $changed->getMetadata() : ['ragId' => 'not-the-scope', 'collection_id' => 'not-the-scope', 'offset' => $offset], $results[0]->getMetadata());
             }
         }
-        self::assertSame('sharedtoken content 0', $this->store->similaritySearch([1.0, 0.0, 0.0])[0]->content);
+        self::assertSame('sharedtoken content 0', $this->store->similaritySearch([1.0, 0.0, 0.0])[0]->getContent());
         $empty = $this->store->forCollection('empty');
         self::assertSame([], $empty->similaritySearch([1.0, 0.0, 0.0]));
         self::assertSame([], $empty->hybridSearch('sharedtoken', [1.0, 0.0, 0.0]));
@@ -368,11 +438,11 @@ final class ParadeDBVectorStoreTest extends TestCase
             }
         }
         foreach ([$target->similaritySearch([1.0, 0.0, 0.0]), $target->hybridSearch('nonexistentlexeme', [1.0, 0.0, 0.0])] as $results) {
-            self::assertSame(['local-first', 'local-second'], array_map(static fn (Document $document): string => (string) $document->id, $results));
+            self::assertSame(['local-first', 'local-second'], array_map(static fn (Document $document): string => (string) $document->getId(), $results));
         }
         $results = $target->hybridSearch('nonexistentlexeme', [1.0, 0.0, 0.0]);
-        self::assertEqualsWithDelta(1 / 61, $results[0]->score, 0.00000001);
-        self::assertEqualsWithDelta(1 / 62, $results[1]->score, 0.00000001);
+        self::assertEqualsWithDelta(1 / 61, $results[0]->getScore(), 0.00000001);
+        self::assertEqualsWithDelta(1 / 62, $results[1]->getScore(), 0.00000001);
     }
 
     public function testLexicalCandidatesAreFilteredBeforeLimitAndRanking(): void
@@ -382,20 +452,20 @@ final class ParadeDBVectorStoreTest extends TestCase
             $target->addDocument($this->document('semantic-'.$i, [1.0, $i / 10, 0.0]));
         }
         $lexical = $this->document('lexical-only', [0.0, 1.0, 0.0]);
-        $lexical->content = 'needle '.str_repeat('padding ', 100);
+        $lexical = $this->withContent($lexical, 'needle '.str_repeat('padding ', 100));
         $target->addDocument($lexical);
         for ($i = 0; $i < 6; ++$i) {
             $outside = $this->document('outside-'.$i, [1.0, 0.0, 0.0]);
-            $outside->content = 'needle';
+            $outside = $this->withContent($outside, 'needle');
             $this->store->forCollection('other')->addDocument($outside);
         }
         // Prove the fixture would starve the local lexical candidate without a pre-limit filter.
         $global = $this->pdo->query("SELECT collection_id FROM {$this->table} WHERE content ||| 'needle' ORDER BY pdb.score(search_id) DESC LIMIT 4")->fetchAll(PDO::FETCH_COLUMN);
         self::assertSame(['other', 'other', 'other', 'other'], $global);
         $results = $target->hybridSearch('needle', [1.0, 0.0, 0.0]);
-        self::assertSame(['lexical-only', 'semantic-0'], array_map(static fn (Document $document): string => (string) $document->id, $results));
+        self::assertSame(['lexical-only', 'semantic-0'], array_map(static fn (Document $document): string => (string) $document->getId(), $results));
         foreach ($results as $result) {
-            self::assertEqualsWithDelta(1 / 61, $result->score, 0.00000001);
+            self::assertEqualsWithDelta(1 / 61, $result->getScore(), 0.00000001);
         }
     }
 
@@ -471,7 +541,7 @@ final class ParadeDBVectorStoreTest extends TestCase
         }
         $store->setupDatabase();
         $store->forCollection('A')->addDocument($this->document('needle', [1.0, 0.0, 0.0]));
-        self::assertSame('needle', $store->forCollection('A')->hybridSearch('needle', [1.0, 0.0, 0.0])[0]->id);
+        self::assertSame('needle', $store->forCollection('A')->hybridSearch('needle', [1.0, 0.0, 0.0])[0]->getId());
     }
 
     public function testLegacyMigrationPreservesDataAndSupportsScopedSearchAndUpsert(): void
@@ -506,18 +576,18 @@ final class ParadeDBVectorStoreTest extends TestCase
         $store->setupDatabase();
         foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])] as $results) {
             self::assertCount(1, $results);
-            self::assertSame("legacy'\\id", $results[0]->id);
-            self::assertEquals(['nested' => ['value' => "O'Reilly"], 'collection_id' => 'metadata-only'], $results[0]->metadata);
+            self::assertSame("legacy'\\id", $results[0]->getId());
+            self::assertEquals(['nested' => ['value' => "O'Reilly"], 'collection_id' => 'metadata-only'], $results[0]->getMetadata());
         }
         $identity = $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn();
         $updated = $this->document("legacy'\\id", [0.8, 0.6, 0.0]);
-        $updated->content = 'legacytoken updated';
+        $updated = $this->withContent($updated, 'legacytoken updated');
         $store->addDocument($updated);
         self::assertSame($identity, $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn());
-        $updated->content = 'legacytoken named';
+        $updated = $this->withContent($updated, 'legacytoken named');
         $store->forCollection('named')->addDocument($updated);
-        self::assertSame('legacytoken updated', $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->content);
-        self::assertSame('legacytoken named', $store->forCollection('named')->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->content);
+        self::assertSame('legacytoken updated', $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->getContent());
+        self::assertSame('legacytoken named', $store->forCollection('named')->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->getContent());
     }
 
     public function testInterruptedLegacyMigrationRollsBackSchemaIndexesAndData(): void
@@ -555,16 +625,16 @@ final class ParadeDBVectorStoreTest extends TestCase
             self::assertFalse($this->pdo->query("SELECT has_table_privilege(current_user, '{$this->table}', 'TRUNCATE')")->fetchColumn());
             $store = new ParadeDBVectorStore($this->pdo, 3, $this->table, 2, 60, 'runtime');
             $document = $this->document('runtime-id', [1.0, 0.0, 0.0]);
-            $document->content = 'runtimetoken initial';
+            $document = $this->withContent($document, 'runtimetoken initial');
             $store->addDocument($document);
             $identity = $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn();
-            $document->content = 'runtimetoken updated';
+            $document = $this->withContent($document, 'runtimetoken updated');
             $store->addDocument($document);
             self::assertSame($identity, $this->pdo->query("SELECT search_id FROM {$this->table}")->fetchColumn());
             foreach ([$store->similaritySearch([1.0, 0.0, 0.0]), $store->hybridSearch('runtimetoken', [1.0, 0.0, 0.0])] as $results) {
                 self::assertCount(1, $results);
-                self::assertSame('runtime-id', $results[0]->id);
-                self::assertSame('runtimetoken updated', $results[0]->content);
+                self::assertSame('runtime-id', $results[0]->getId());
+                self::assertSame('runtimetoken updated', $results[0]->getContent());
             }
             $store->deleteBy('manual');
             self::assertSame([], $this->storedIds('runtime'));
@@ -588,9 +658,9 @@ final class ParadeDBVectorStoreTest extends TestCase
         $this->pdo->beginTransaction();
         $this->store->addDocument($this->document('outer', [1.0, 0.0, 0.0]));
         $changed = $this->document('shared', [0.0, 1.0, 0.0]);
-        $changed->content = 'changed';
+        $changed = $this->withContent($changed, 'changed');
         $bad = $this->document('bad', [1.0, 0.0, 0.0]);
-        $bad->content = 'rejectme';
+        $bad = $this->withContent($bad, 'rejectme');
         try {
             $target->addDocuments([$changed, $this->document('new', [1.0, 0.0, 0.0]), $bad]);
             self::fail('The scoped batch must roll back to its savepoint.');
@@ -688,7 +758,7 @@ final class ParadeDBVectorStoreTest extends TestCase
         $this->pdo->exec("DROP INDEX {$this->table}_bm25_idx");
         $this->migrateLegacyTable();
         $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
-        self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->id);
+        self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->getId());
     }
 
     public function testUpgradeDoesNotDropIndexBelongingToAnotherTable(): void
@@ -723,7 +793,7 @@ final class ParadeDBVectorStoreTest extends TestCase
             $this->pdo->exec("CREATE INDEX {$this->table}_bm25_idx ON public.{$this->table} (id)");
             $this->migrateLegacyTable();
             $store = new ParadeDBVectorStore($this->pdo, 3, $this->table);
-            self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->id);
+            self::assertSame("legacy'\\id", $store->hybridSearch('legacytoken', [1.0, 0.0, 0.0])[0]->getId());
             self::assertSame('btree', $this->pdo->query("SELECT am.amname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE c.relname = '{$this->table}_bm25_idx' AND n.nspname = 'public'")->fetchColumn());
         } finally {
             $this->pdo->exec("DROP TABLE IF EXISTS {$schema}.{$this->table}");
@@ -760,11 +830,18 @@ final class ParadeDBVectorStoreTest extends TestCase
     private function document(string $id, array $embedding, string $sourceType = 'manual', string $sourceName = 'manual'): Document
     {
         $document = new Document($id);
-        $document->id = $id;
-        $document->embedding = $embedding;
-        $document->sourceType = $sourceType;
-        $document->sourceName = $sourceName;
+        $document->setId($id);
+        $document->setEmbedding($embedding);
+        $document->setSourceType($sourceType);
+        $document->setSourceName($sourceName);
         return $document;
+    }
+
+    private function withContent(Document $document, string $content): Document
+    {
+        return (new Document($content))->setId($document->getId())
+            ->setEmbedding($document->getEmbedding())->setMetadata($document->getMetadata())
+            ->setSourceType($document->getSourceType())->setSourceName($document->getSourceName());
     }
 
     /** @return list<string> */

@@ -5,6 +5,13 @@ declare(strict_types=1);
 namespace Semhoun\NeuronParadeDB\Tests\Unit;
 
 use InvalidArgumentException;
+use NeuronAI\Exceptions\VectorStoreException;
+use NeuronAI\RAG\Document;
+use NeuronAI\RAG\Schema\DocumentField;
+use NeuronAI\RAG\Schema\DocumentSchema;
+use NeuronAI\RAG\Schema\DocumentSchemaException;
+use NeuronAI\RAG\VectorStore\Filter\Filter;
+use NeuronAI\RAG\VectorStore\SearchRequest;
 use PDO;
 use PDOStatement;
 use PHPUnit\Framework\TestCase;
@@ -14,6 +21,99 @@ use Semhoun\NeuronParadeDB\VectorStore\ParadeDBVectorStore;
 
 final class ParadeDBVectorStoreTest extends TestCase
 {
+    public function testRequestLimitsFiltersAndCollectionArePerCall(): void
+    {
+        $sql = [];
+        $bindings = [];
+        $check = $this->createStub(PDOStatement::class);
+        $check->method('execute')->willReturn(true);
+        $check->method('fetch')->willReturn(false);
+        $result = $this->createMock(PDOStatement::class);
+        $result->expects(self::exactly(4))->method('execute')->willReturnCallback(static function (array $params) use (&$bindings): bool {
+            $bindings[] = $params;
+            return true;
+        });
+        $result->method('fetch')->willReturn(false);
+        $pdo = $this->createMock(PDO::class);
+        $pdo->expects(self::exactly(5))->method('prepare')->willReturnCallback(static function (string $query) use ($check, $result, &$sql): PDOStatement {
+            if (str_contains($query, 'pg_catalog')) {
+                return $check;
+            }
+            $sql[] = $query;
+            return $result;
+        });
+        $store = new ParadeDBVectorStore($pdo, 3, topK: 7, collectionId: 'A');
+        $filter = Filter::where('sourceType', 'web')->whereAny(Filter::eq('sourceName', 'one'), Filter::eq('sourceName', 'two'));
+        $store->search(new SearchRequest([1.0, 0.0, 0.0], $filter, 1));
+        $store->hybridSearch('query', [1.0, 0.0, 0.0], $filter, 2);
+        $store->search(new SearchRequest([1.0, 0.0, 0.0]));
+        $store->delete($filter);
+        self::assertStringContainsString('LIMIT 1', $sql[0]);
+        self::assertStringContainsString('collection_id = :collection_id AND (', $sql[0]);
+        self::assertStringContainsString('collection_id = :vector_collection_id AND (', $sql[1]);
+        self::assertStringContainsString('collection_id = :bm25_collection_id AND (', $sql[1]);
+        self::assertSame(2, substr_count($sql[1], 'LIMIT 4'));
+        self::assertStringEndsWith('LIMIT 2', $sql[1]);
+        self::assertStringContainsString('LIMIT 7', $sql[2]);
+        self::assertStringContainsString('AND TRUE', $sql[2]);
+        self::assertStringContainsString('collection_id = :collection_id AND (', $sql[3]);
+        self::assertSame('A', $bindings[0][':collection_id']);
+        self::assertSame('A', $bindings[1][':vector_collection_id']);
+        self::assertSame('A', $bindings[1][':bm25_collection_id']);
+        self::assertSame('web', $bindings[1][':vf0']);
+        self::assertSame('web', $bindings[1][':bf0']);
+        self::assertCount(2, $bindings[2]);
+    }
+
+    public function testInvalidDocumentsAreRejectedBeforeStartingBatch(): void
+    {
+        $schema = DocumentSchema::of(DocumentField::string('tenant')->required()->filterable());
+        foreach ([null, [], ['tenant' => null], ['tenant' => 1], ['tenant' => 'A', 'extra' => new \stdClass()]] as $metadata) {
+            $pdo = $this->pdoWithMissingTable();
+            $pdo->expects(self::never())->method('beginTransaction');
+            $store = new ParadeDBVectorStore($pdo, 3, schema: $schema);
+            self::assertSame($schema, $store->getSchema());
+            $good = (new Document('good'))->setMetadata(['tenant' => 'A'])->setEmbedding([1, 0, 0]);
+            $bad = (new Document('bad'))->setMetadata($metadata ?? ['tenant' => 'A']);
+            if ($metadata !== null) {
+                $bad->setEmbedding([1, 0, 0]);
+            }
+            try {
+                $store->addDocuments([$good, $bad]);
+                self::fail('The entire batch must be validated before any write.');
+            } catch (DocumentSchemaException|VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+        }
+    }
+
+    public function testInvalidRequestsAndFiltersAreRejectedBeforeSql(): void
+    {
+        foreach ([[1.0], [0.0, 0.0, 0.0], [INF, 0.0, 0.0], [NAN, 0.0, 0.0], [1 => 1.0, 2 => 0.0, 3 => 0.0]] as $embedding) {
+            $store = new ParadeDBVectorStore($this->pdoWithMissingTable(), 3);
+            try {
+                $store->search(new SearchRequest($embedding));
+                self::fail('Invalid vectors must be rejected before SQL.');
+            } catch (VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+        }
+        foreach (['search', 'hybrid', 'delete', 'topK'] as $operation) {
+            $store = new ParadeDBVectorStore($this->pdoWithMissingTable(), 3);
+            try {
+                match ($operation) {
+                    'search' => $store->search(new SearchRequest([1, 0, 0], Filter::eq('unknown', 'x'))),
+                    'hybrid' => $store->hybridSearch('query', [1, 0, 0], Filter::eq('unknown', 'x')),
+                    'delete' => $store->delete(Filter::eq('unknown', 'x')),
+                    'topK' => $store->hybridSearch('query', [1, 0, 0], topK: 0),
+                };
+                self::fail('Invalid requests must not prepare SQL.');
+            } catch (DocumentSchemaException|VectorStoreException $exception) {
+                self::assertNotSame('', $exception->getMessage());
+            }
+        }
+    }
+
     public function testDefaultConstructorDoesNotCreateDatabaseObjects(): void
     {
         $pdo = $this->pdoWithMissingTable();

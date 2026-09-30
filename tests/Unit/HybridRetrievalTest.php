@@ -7,12 +7,34 @@ namespace Semhoun\NeuronParadeDB\Tests\Unit;
 use NeuronAI\Chat\Messages\UserMessage;
 use NeuronAI\RAG\Document;
 use NeuronAI\RAG\Embeddings\EmbeddingsProviderInterface;
+use NeuronAI\RAG\VectorStore\Filter\Filter;
+use NeuronAI\RAG\VectorStore\Filter\FilterExpression;
+use NeuronAI\RAG\VectorStore\Filter\FilterScope;
 use PHPUnit\Framework\TestCase;
 use Semhoun\NeuronParadeDB\Retrieval\HybridRetrieval;
 use Semhoun\NeuronParadeDB\VectorStore\HybridVectorStoreInterface;
 
 final class HybridRetrievalTest extends TestCase
 {
+    public function testMandatoryFiltersAreAndedWithOwnScopeAndDoNotLeak(): void
+    {
+        $own = Filter::eq('sourceType', 'web');
+        $incoming = Filter::where('tenant', 'A')->whereAny(Filter::eq('status', 'public'), Filter::eq('status', 'review'));
+        $provider = $this->createStub(EmbeddingsProviderInterface::class);
+        $provider->method('embedText')->willReturn([1.0]);
+        $store = $this->createMock(HybridVectorStoreInterface::class);
+        $seen = [];
+        $store->expects(self::exactly(2))->method('hybridSearch')
+            ->willReturnCallback(static function (string $query, array $embedding, ?FilterExpression $filters) use (&$seen): array {
+                $seen[] = $filters?->toArray();
+                return [];
+            });
+        $retrieval = new HybridRetrieval($store, $provider, $own);
+        $retrieval->retrieve(new UserMessage('query'), $incoming);
+        $retrieval->retrieve(new UserMessage('query'));
+        self::assertSame([FilterScope::merge($own, $incoming)->expression()->toArray(), $own->toArray()], $seen);
+    }
+
     public function testPassesExactQueryAndEmbeddingAndMaterializesGenerator(): void
     {
         $query = "  Exact 'query' + punctuation?\nsecond line  ";
@@ -25,7 +47,7 @@ final class HybridRetrievalTest extends TestCase
         $provider->expects(self::never())->method('embedDocument');
         $provider->expects(self::never())->method('embedDocuments');
         $store = $this->createMock(HybridVectorStoreInterface::class);
-        $store->expects(self::never())->method('similaritySearch');
+        $store->expects(self::never())->method('search');
         $store->expects(self::once())->method('hybridSearch')
             ->with(self::identicalTo($query), self::identicalTo($embedding))
             ->willReturn((static function () use ($first, $second): \Generator {

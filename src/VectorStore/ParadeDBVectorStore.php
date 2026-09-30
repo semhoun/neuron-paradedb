@@ -7,7 +7,11 @@ namespace Semhoun\NeuronParadeDB\VectorStore;
 use InvalidArgumentException;
 use NeuronAI\Exceptions\VectorStoreException;
 use NeuronAI\RAG\Document;
+use NeuronAI\RAG\Schema\DocumentSchema;
 use NeuronAI\RAG\VectorSimilarity;
+use NeuronAI\RAG\VectorStore\Filter\FilterExpression;
+use NeuronAI\RAG\VectorStore\HasDocumentSchema;
+use NeuronAI\RAG\VectorStore\SearchRequest;
 use NeuronAI\RAG\VectorStore\VectorStoreInterface;
 use PDO;
 use PDOStatement;
@@ -15,6 +19,8 @@ use Throwable;
 
 class ParadeDBVectorStore implements HybridVectorStoreInterface
 {
+    use HasDocumentSchema;
+
     protected readonly string $tableName;
     protected readonly string $bm25IndexName;
     protected readonly string $vectorIndexName;
@@ -26,6 +32,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         protected readonly int $topK = 4,
         protected readonly int $rrfK = 60,
         protected ?string $collectionId = null,
+        ?DocumentSchema $schema = null,
     ) {
         if ($collectionId === '') {
             throw new InvalidArgumentException('Collection IDs must be nonempty; use null for no collection.');
@@ -37,6 +44,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             throw new InvalidArgumentException('Table names must be SQL identifiers of at most 48 ASCII characters.');
         }
 
+        $this->initializeSchema($schema);
         $this->tableName = '"'.$tableName.'"';
         $this->bm25IndexName = '"'.$tableName.'_bm25_idx"';
         $this->vectorIndexName = '"'.$tableName.'_embedding_idx"';
@@ -237,6 +245,14 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             return $this;
         }
 
+        foreach ($documents as $document) {
+            if (!$document instanceof Document) {
+                throw new InvalidArgumentException('Every batch entry must be a Document.');
+            }
+            $this->validateDocument($document);
+            $this->encodeEmbedding($document->getEmbedding() ?? []);
+        }
+
         $savepoint = $this->pdo->inTransaction() ? '"neuron_paradedb_'.bin2hex(random_bytes(12)).'"' : null;
         if ($savepoint !== null) {
             $this->executeSql('SAVEPOINT '.$savepoint);
@@ -259,17 +275,14 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
                 $this->tableName,
             ));
             foreach ($documents as $document) {
-                if (!$document instanceof Document) {
-                    throw new InvalidArgumentException('Every batch entry must be a Document.');
-                }
                 $this->executeStatement($statement, [
                     ':collection_id' => $this->collectionId ?? '',
                     ':id' => (string) $document->getId(),
                     ':content' => $document->getContent(),
                     ':source_type' => $document->getSourceType(),
                     ':source_name' => $document->getSourceName(),
-                    ':metadata' => json_encode($document->metadata, JSON_THROW_ON_ERROR),
-                    ':embedding' => $this->encodeEmbedding($document->getEmbedding()),
+                    ':metadata' => json_encode((object) $document->getMetadata(), JSON_THROW_ON_ERROR),
+                    ':embedding' => $this->encodeEmbedding($document->getEmbedding() ?? []),
                 ]);
             }
             if ($savepoint !== null) {
@@ -298,7 +311,16 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         return $this;
     }
 
-    /** @deprecated Use deleteBy() instead. */
+    public function delete(FilterExpression $filters): VectorStoreInterface
+    {
+        $compiled = (new ParadeDBFilterCompiler($this->schema))->compile($filters);
+        $statement = $this->prepare('DELETE FROM '.$this->tableName.' WHERE collection_id = :collection_id AND '.$compiled['sql']);
+        $this->executeStatement($statement, [':collection_id' => $this->collectionId ?? ''] + $compiled['bindings']);
+
+        return $this;
+    }
+
+    /** @deprecated Use delete() instead. */
     public function deleteBySource(string $sourceType, string $sourceName): VectorStoreInterface
     {
         return $this->deleteBy($sourceType, $sourceName);
@@ -340,20 +362,28 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
      */
     public function similaritySearch(array $embedding): array
     {
-        $vector = $this->encodeEmbedding($embedding);
+        return $this->search(new SearchRequest($embedding));
+    }
+
+    /** @return Document[] */
+    public function search(SearchRequest $request): array
+    {
+        $vector = $this->encodeEmbedding($request->embedding);
+        $compiled = (new ParadeDBFilterCompiler($this->schema))->compile($request->filters);
         $statement = $this->prepare(sprintf(
             <<<'SQL'
                 SELECT id, content, source_type, source_name, metadata, embedding,
                        embedding <=> CAST(:embedding AS vector) AS distance
                 FROM %s
-                WHERE collection_id = :collection_id
+                WHERE collection_id = :collection_id AND %s
                 ORDER BY distance
                 LIMIT %d
                 SQL,
             $this->tableName,
-            $this->topK,
+            $compiled['sql'],
+            $request->topK ?? $this->topK,
         ));
-        $this->executeStatement($statement, [':embedding' => $vector, ':collection_id' => $this->collectionId ?? '']);
+        $this->executeStatement($statement, [':embedding' => $vector, ':collection_id' => $this->collectionId ?? ''] + $compiled['bindings']);
 
         return $this->hydrateDocuments($statement, true);
     }
@@ -362,23 +392,28 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
      * @param float[] $embedding
      * @return Document[]
      */
-    public function hybridSearch(string $query, array $embedding): array
+    public function hybridSearch(string $query, array $embedding, ?FilterExpression $filters = null, ?int $topK = null): array
     {
+        $request = new SearchRequest($embedding, $filters, $topK);
+        $topK = $request->topK ?? $this->topK;
         $vector = $this->encodeEmbedding($embedding);
-        $candidateLimit = $this->topK > intdiv(PHP_INT_MAX, 2) ? PHP_INT_MAX : $this->topK * 2;
+        $compiler = new ParadeDBFilterCompiler($this->schema);
+        $vectorFilters = $compiler->compile($filters, 'vf');
+        $bm25Filters = $compiler->compile($filters, 'bf');
+        $candidateLimit = $topK > intdiv(PHP_INT_MAX, 2) ? PHP_INT_MAX : $topK * 2;
         $statement = $this->prepare(sprintf(
             <<<'SQL'
                 WITH vector_results AS (
                     SELECT search_id, ROW_NUMBER() OVER (ORDER BY embedding <=> CAST(:embedding AS vector)) AS rank
                     FROM %1$s
-                    WHERE collection_id = :vector_collection_id
+                    WHERE collection_id = :vector_collection_id AND %5$s
                     ORDER BY embedding <=> CAST(:ordered_embedding AS vector)
                     LIMIT %2$d
                 ),
                 bm25_results AS (
                     SELECT search_id, ROW_NUMBER() OVER (ORDER BY pdb.score(search_id) DESC) AS rank
                     FROM %1$s
-                    WHERE content ||| :query AND collection_id = :bm25_collection_id
+                    WHERE content ||| :query AND collection_id = :bm25_collection_id AND %6$s
                     ORDER BY pdb.score(search_id) DESC
                     LIMIT %2$d
                 ),
@@ -401,7 +436,9 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             $this->tableName,
             $candidateLimit,
             $this->rrfK,
-            $this->topK,
+            $topK,
+            $vectorFilters['sql'],
+            $bm25Filters['sql'],
         ));
         $this->executeStatement($statement, [
             ':embedding' => $vector,
@@ -409,7 +446,7 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
             ':query' => $query,
             ':vector_collection_id' => $this->collectionId ?? '',
             ':bm25_collection_id' => $this->collectionId ?? '',
-        ]);
+        ] + $vectorFilters['bindings'] + $bm25Filters['bindings']);
 
         return $this->hydrateDocuments($statement);
     }
@@ -420,20 +457,20 @@ class ParadeDBVectorStore implements HybridVectorStoreInterface
         $documents = [];
         while ($row = $statement->fetch(PDO::FETCH_ASSOC)) {
             $document = new Document((string) $row['content']);
-            $document->id = (string) $row['id'];
-            $document->sourceType = (string) $row['source_type'];
-            $document->sourceName = (string) $row['source_name'];
-            $document->score = $distanceScore
+            $document->setId((string) $row['id']);
+            $document->setSourceType((string) $row['source_type']);
+            $document->setSourceName((string) $row['source_name']);
+            $document->setScore($distanceScore
                 ? VectorSimilarity::similarityFromDistance((float) $row['distance'])
-                : (float) $row['score'];
+                : (float) $row['score']);
             $metadata = json_decode((string) $row['metadata'], true, flags: JSON_THROW_ON_ERROR);
             $embedding = json_decode((string) $row['embedding'], true, flags: JSON_THROW_ON_ERROR);
             if (!is_array($metadata) || !is_array($embedding)) {
                 throw new VectorStoreException('Stored metadata and embedding must decode to arrays.');
             }
             $this->encodeEmbedding($embedding);
-            $document->metadata = $metadata;
-            $document->embedding = array_map(static fn (int|float $value): float => (float) $value, $embedding);
+            $document->setMetadata($metadata);
+            $document->setEmbedding($embedding);
             $documents[] = $document;
         }
 
